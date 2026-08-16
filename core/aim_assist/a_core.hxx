@@ -30,6 +30,9 @@ namespace assist {
         float max_correction = 0.78f;   // multiples of the hit radius
         float speed_mult = 1.f;
         float anticipation_ms = 520.f;
+        float adaptive_difficulty = 0.f;
+        float adaptive_boost = 0.f;
+        float large_jump_demand = 0.f;
     };
 
     struct vec2 {
@@ -62,7 +65,20 @@ namespace assist {
         float bind_y = 0.f;
         bool requested_correction = false;
         bool relevant_approach = false;
+        bool has_target = false;
+        bool max_correction_clamped = false;
         float requested_correction_magnitude = 0.f;
+        float rescue_demand = 0.f;
+        float prediction_confidence = 0.f;
+        uint32_t raw_history_reports = 0;
+        int32_t high_rescue_bind_id = 0;
+        int32_t large_rescue_bind_id = 0;
+        bool high_difficulty_rescue_activation = false;
+        bool large_jump_rescue_activation = false;
+        bool has_last_corrected_miss = false;
+        float last_corrected_miss = 0.f;
+        bool final_correction_sample = false;
+        float final_correction_miss = 0.f;
         float safe_destination_multiplier = 0.f;
         float closest_predicted_miss = 0.f;
         gate_result last_gate_result = gate_result::none;
@@ -163,13 +179,20 @@ namespace assist {
         const vec2 raw{ sx, sy };
         mem.requested_correction = false;
         mem.relevant_approach = false;
+        mem.has_target = false;
+        mem.max_correction_clamped = false;
         mem.requested_correction_magnitude = 0.f;
+        mem.rescue_demand = 0.f;
+        mem.high_difficulty_rescue_activation = false;
+        mem.large_jump_rescue_activation = false;
+        mem.final_correction_sample = false;
         mem.last_gate_result = gate_result::none;
         if ( !mem.has_raw ) {
             mem.raw_pos = raw;
             mem.has_raw = true;
         }
 
+        const vec2 previous_filtered_velocity = mem.raw_velocity;
         vec2 measured_velocity = ( raw - mem.raw_pos ) * ( 1.f / dt );
         measured_velocity = limit_length( measured_velocity, 12000.f );
 
@@ -178,6 +201,25 @@ namespace assist {
         const float velocity_alpha = 1.f - std::exp( -dt / 0.018f );
         mem.raw_velocity += ( measured_velocity - mem.raw_velocity ) * velocity_alpha;
         mem.raw_pos = raw;
+        if ( mem.raw_history_reports < UINT32_MAX )
+            mem.raw_history_reports++;
+
+        const float previous_speed = length( previous_filtered_velocity );
+        const float filtered_speed = length( mem.raw_velocity );
+        float direction_consistency = 1.f;
+        if ( previous_speed > 80.f && filtered_speed > 80.f ) {
+            const float cosine = std::clamp(
+                dot( previous_filtered_velocity, mem.raw_velocity ) /
+                ( previous_speed * filtered_speed ), -1.f, 1.f );
+            direction_consistency = 0.5f + 0.5f * cosine;
+        }
+        const float speed_consistency = 1.f - saturate(
+            std::abs( filtered_speed - previous_speed ) /
+            std::max( std::max( filtered_speed, previous_speed ), 250.f ) );
+        const float history_confidence = smoothstep(
+            2.f, 6.f, static_cast<float>( mem.raw_history_reports ) );
+        mem.prediction_confidence = history_confidence *
+            ( 0.55f + 0.30f * direction_consistency + 0.15f * speed_consistency );
 
         int32_t tick = 0;
         if ( markers && n_markers > 0 )
@@ -188,7 +230,13 @@ namespace assist {
         float max_displacement = mem.last_max_displacement;
 
         if ( target ) {
+            mem.has_target = true;
             const bool target_changed = mem.bind_id != 0 && mem.bind_id != target->start_time;
+            if ( target_changed && mem.has_last_corrected_miss ) {
+                mem.final_correction_sample = true;
+                mem.final_correction_miss = mem.last_corrected_miss;
+                mem.has_last_corrected_miss = false;
+            }
             const auto projected = playfield::playfield_to_screen(
                 target->x, target->y, frame );
             const vec2 target_screen{
@@ -212,6 +260,9 @@ namespace assist {
             // Extra follow-through is deliberately concentrated in the upper half of the
             // slider so low/medium settings retain their established subtle character.
             const float upper_authority = smoothstep( 0.45f, 0.95f, strength );
+            const float hard_jump_rescue = saturate( params.adaptive_boost ) *
+                smoothstep( 0.60f, 0.85f, params.adaptive_difficulty ) *
+                smoothstep( 0.45f, 0.85f, params.large_jump_demand );
             const float accepted_safe_multiplier =
                 0.86f + ( 0.58f - 0.86f ) * authority;
             const float safe_destination_multiplier =
@@ -219,7 +270,7 @@ namespace assist {
             const float accepted_safe_radius = hit_radius * accepted_safe_multiplier;
             const float safe_destination_radius = hit_radius * safe_destination_multiplier;
             mem.safe_destination_multiplier = safe_destination_multiplier;
-            max_displacement = hit_radius * std::clamp( params.max_correction, 0.1f, 1.25f );
+            max_displacement = hit_radius * std::clamp( params.max_correction, 0.1f, 1.75f );
             mem.last_max_displacement = max_displacement;
 
             const vec2 to_target = target_screen - raw;
@@ -230,8 +281,12 @@ namespace assist {
 
             const int32_t eta_ms = target->start_time - tick;
             constexpr float prediction_horizon_max = 0.090f;
-            const float prediction_horizon = std::clamp(
+            const float base_prediction_horizon = std::clamp(
                 static_cast<float>( eta_ms ) * 0.001f, 0.012f, prediction_horizon_max );
+            // A short or inconsistent input history shortens only the speculative part of
+            // prediction. Stable tablet motion still receives the full 90 ms look-ahead.
+            const float prediction_horizon = base_prediction_horizon *
+                ( 0.65f + 0.35f * mem.prediction_confidence );
             // Use the closest point on the short raw-velocity segment rather than only its
             // endpoint. A natural trajectory that passes through the hit region therefore
             // produces little or no correction even if it would be past the centre at the
@@ -256,19 +311,26 @@ namespace assist {
             // Higher authority reaches useful distance gain earlier once inside the
             // configured radius. The gain remains exactly zero at and beyond its edge.
             const float distance_full_progress =
-                0.72f + ( 0.38f - 0.72f ) * authority - 0.10f * upper_authority;
+                0.72f + ( 0.38f - 0.72f ) * authority -
+                0.10f * upper_authority - 0.06f * saturate( params.adaptive_boost ) -
+                0.05f * hard_jump_rescue;
             const float outer_gate = current_distance < outer_radius
-                ? smoothstep( 0.f, distance_full_progress, distance_progress ) : 0.f;
+                ? smoothstep( 0.f, std::max( distance_full_progress, 0.20f ), distance_progress ) : 0.f;
 
             // Preserve a true zero-assistance interior, then add a graduated cross-track
             // stabilisation band inside the accepted-safe radius at high authority. This
             // still points only toward the safe destination radius, never exact centre.
             const float full_miss_multiplier =
-                1.18f + ( 0.92f - 1.18f ) * authority;
+                1.18f + ( 0.92f - 1.18f ) * authority -
+                0.06f * hard_jump_rescue;
+            const float adaptive_interior_authority = saturate(
+                upper_authority + 0.18f * saturate( params.adaptive_boost ) );
             const float zero_inner_multiplier = accepted_safe_multiplier +
-                ( safe_destination_multiplier - accepted_safe_multiplier ) * upper_authority;
+                ( safe_destination_multiplier - accepted_safe_multiplier ) *
+                adaptive_interior_authority;
             const float zero_inner_radius = hit_radius * zero_inner_multiplier;
-            const float interior_gate_ceiling = 0.32f * upper_authority;
+            const float interior_gate_ceiling = std::min(
+                0.40f, 0.32f * upper_authority + 0.08f * saturate( params.adaptive_boost ) );
             float inner_gate = 0.f;
             if ( predicted_distance <= accepted_safe_radius ) {
                 inner_gate = interior_gate_ceiling * smoothstep(
@@ -289,7 +351,8 @@ namespace assist {
             const float strength_anticipation_offset =
                 -30.f + ( 35.f - -30.f ) * authority;
             const float anticipation_ms = std::clamp(
-                params.anticipation_ms + strength_anticipation_offset, 440.f, 640.f );
+                params.anticipation_ms + strength_anticipation_offset +
+                20.f * hard_jump_rescue, 440.f, 640.f );
             const float early_timing_gain = 0.12f + ( 0.28f - 0.12f ) * authority;
             float timing_gate = 1.f;
             if ( eta > 70.f ) {
@@ -317,18 +380,48 @@ namespace assist {
 
             const float needed_distance = std::max(
                 predicted_distance - safe_destination_radius, 0.f );
+            mem.rescue_demand = saturate(
+                needed_distance / std::max( max_displacement, hit_radius ) );
             vec2 minimum_path_translation{};
             if ( predicted_distance > 0.001f ) {
                 minimum_path_translation = predicted_to_target *
                     ( needed_distance / predicted_distance );
             }
 
-            const float envelope = outer_gate * inner_gate * timing_gate * direction_gate;
+            const float speculative_miss = smoothstep(
+                outer_radius, outer_radius * 2.5f, predicted_distance );
+            const float speculative_reduction = 0.35f *
+                ( 1.f - 0.35f * hard_jump_rescue );
+            const float prediction_gate = 1.f - speculative_reduction * speculative_miss *
+                ( 1.f - mem.prediction_confidence );
+            const float envelope = outer_gate * inner_gate * timing_gate *
+                direction_gate * prediction_gate;
+            const float correction_gain = strength * envelope;
+            if ( length_sq( minimum_path_translation ) >
+                 max_displacement * max_displacement &&
+                 max_displacement * correction_gain > 0.05f ) {
+                mem.max_correction_clamped = true;
+            }
             desired_offset = limit_length( minimum_path_translation, max_displacement );
-            desired_offset = desired_offset * ( strength * envelope );
+            desired_offset = desired_offset * correction_gain;
             desired_offset = limit_length( desired_offset, max_displacement );
             mem.requested_correction_magnitude = length( desired_offset );
             mem.requested_correction = mem.requested_correction_magnitude > 0.05f;
+            if ( mem.requested_correction ) {
+                mem.has_last_corrected_miss = true;
+                mem.last_corrected_miss = predicted_distance;
+                if ( params.adaptive_boost > 0.01f &&
+                     params.adaptive_difficulty >= 0.60f &&
+                     mem.high_rescue_bind_id != target->start_time ) {
+                    mem.high_rescue_bind_id = target->start_time;
+                    mem.high_difficulty_rescue_activation = true;
+                }
+                if ( hard_jump_rescue > 0.05f &&
+                     mem.large_rescue_bind_id != target->start_time ) {
+                    mem.large_rescue_bind_id = target->start_time;
+                    mem.large_jump_rescue_activation = true;
+                }
+            }
 
             // Record one mutually-exclusive result per target-bearing report. This keeps
             // rejection telemetry cheap and makes selectivity measurable after a play.
@@ -364,6 +457,11 @@ namespace assist {
 
         }
         else {
+            if ( mem.has_last_corrected_miss ) {
+                mem.final_correction_sample = true;
+                mem.final_correction_miss = mem.last_corrected_miss;
+                mem.has_last_corrected_miss = false;
+            }
             mem.bind_id = 0;
         }
 
@@ -373,7 +471,16 @@ namespace assist {
         const float smoothing = std::clamp( params.smoothing_ms, 35.f, 180.f ) * 0.001f;
         const float response_authority = smoothstep(
             0.45f, 0.95f, saturate( params.strength * 0.01f ) );
-        const float response_scale = 1.f + 0.35f * response_authority;
+        const float hard_jump_response = saturate( params.adaptive_boost ) *
+            smoothstep( 0.60f, 0.85f, params.adaptive_difficulty ) *
+            smoothstep( 0.45f, 0.85f, params.large_jump_demand );
+        const float adaptive_rescue_response = saturate(
+            saturate( params.adaptive_boost ) *
+            smoothstep( 0.60f, 0.85f, params.adaptive_difficulty ) *
+            smoothstep( 0.15f, 0.65f, mem.rescue_demand ) *
+            ( 1.f + 0.18f * hard_jump_response ) );
+        const float response_scale = 1.f + 0.35f * response_authority +
+            0.15f * adaptive_rescue_response;
         const float omega = 2.6f * response_scale / smoothing;
         vec2 requested_acceleration =
             ( desired_offset - mem.assist_offset ) * ( omega * omega ) -
@@ -392,16 +499,20 @@ namespace assist {
                 direction * std::max( velocity_parallel, 0.f );
             const float transition_weight = saturate(
                 mem.target_switch_damping_remaining / 0.080f );
+            const float switch_clear_scale = 1.f +
+                0.60f * adaptive_rescue_response;
             requested_acceleration += incompatible_offset *
-                ( -omega * omega * 1.8f * transition_weight );
+                ( -omega * omega * 1.8f * switch_clear_scale * transition_weight );
             requested_acceleration += incompatible_velocity *
-                ( -omega * 2.4f * transition_weight );
+                ( -omega * 2.4f * switch_clear_scale * transition_weight );
             mem.target_switch_damping_remaining = std::max(
                 0.f, mem.target_switch_damping_remaining - dt );
         }
 
-        const float velocity_factor = 2.20f + 0.80f * response_authority;
-        const float acceleration_factor = 3.0f + 0.80f * response_authority;
+        const float velocity_factor = 2.20f + 0.80f * response_authority +
+            0.35f * adaptive_rescue_response;
+        const float acceleration_factor = 3.0f + 0.80f * response_authority +
+            0.50f * adaptive_rescue_response;
         const float max_velocity = std::max(
             60.f, max_displacement * velocity_factor / smoothing );
         const float max_acceleration = std::max(
@@ -423,6 +534,7 @@ namespace assist {
 
         const float offset_length = length( mem.assist_offset );
         if ( offset_length > max_displacement && offset_length > 0.001f ) {
+            mem.max_correction_clamped = true;
             const vec2 outward = mem.assist_offset * ( 1.f / offset_length );
             mem.assist_offset = outward * max_displacement;
             const float outward_speed = dot( mem.assist_velocity, outward );

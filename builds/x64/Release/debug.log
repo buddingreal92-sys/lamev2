@@ -1,3 +1,2 @@
-[06:37:03.827] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=552
-[06:37:03.827] lazer nested duration field resolved: 0x28
-[06:40:38.689] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=552
+[10:15:47.801] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=190
+[10:15:47.801] lazer nested duration field resolved: 0x28

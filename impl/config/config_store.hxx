@@ -16,12 +16,12 @@ namespace config {
         bool aim_enabled = true;
         bool aim_ignore_sliders = false;
         bool aim_tablet_mode = true;
-        float aim_strength = 62.f;
-        float aim_radius = 2.55f;
-        float aim_smoothing_ms = 78.f;
-        float aim_max_correction = 0.78f;
-        bool aim_adaptive = false;
-        float aim_adaptation_strength = 60.f;
+        float aim_strength = 80.f;
+        float aim_radius = 3.70f;
+        float aim_smoothing_ms = 65.f;
+        float aim_max_correction = 1.60f;
+        bool aim_adaptive = true;
+        float aim_adaptation_strength = 80.f;
 
 
         bool relax_enabled = true;
@@ -48,12 +48,19 @@ namespace config {
         bool replay_parse_buttons = true;
 
         bool autobot_enabled = false;
-        float autobot_aim_spread = 0.15f;
-        float autobot_curve_strength = 0.33f;
-        float autobot_drift_amount = 1.5f;
-        float autobot_momentum = 0.85f;
-        float autobot_slider_laziness = 0.15f;
-        float autobot_spinner_rpm = 400.f;
+        float autobot_target_accuracy = 98.5f;
+        float autobot_aim_spread = 0.10f;
+        float autobot_curve_strength = 0.36f;
+        float autobot_drift_amount = 1.05f;
+        float autobot_momentum = 0.82f;
+        float autobot_slider_laziness = 0.08f;
+        float autobot_spinner_rpm = 420.f;
+        bool autobot_startup_motion = true;
+        bool autobot_break_motion = true;
+        bool autobot_energetic_dances = true;
+        bool autobot_gameplay_flow = true;
+        float autobot_startup_energy = 0.82f;
+        float autobot_break_energy = 0.68f;
 
         bool tap_enabled = false;
         int tap_assist_window = 125;
@@ -197,12 +204,19 @@ namespace config {
         write_line( out, "replay.parse_buttons", s.replay_parse_buttons );
 
         write_line( out, "autobot.enabled", s.autobot_enabled );
+        write_line( out, "autobot.target_accuracy", s.autobot_target_accuracy );
         write_line( out, "autobot.aim_spread", s.autobot_aim_spread );
         write_line( out, "autobot.curve_strength", s.autobot_curve_strength );
         write_line( out, "autobot.drift_amount", s.autobot_drift_amount );
         write_line( out, "autobot.momentum", s.autobot_momentum );
         write_line( out, "autobot.slider_laziness", s.autobot_slider_laziness );
         write_line( out, "autobot.spinner_rpm", s.autobot_spinner_rpm );
+        write_line( out, "autobot.startup_motion", s.autobot_startup_motion );
+        write_line( out, "autobot.break_motion", s.autobot_break_motion );
+        write_line( out, "autobot.energetic_dances", s.autobot_energetic_dances );
+        write_line( out, "autobot.gameplay_flow", s.autobot_gameplay_flow );
+        write_line( out, "autobot.startup_energy", s.autobot_startup_energy );
+        write_line( out, "autobot.break_energy", s.autobot_break_energy );
 
         write_line( out, "tap.enabled", s.tap_enabled );
         write_line( out, "tap.assist_window", s.tap_assist_window );
@@ -350,6 +364,8 @@ namespace config {
                 parse_bool( val, s.replay_parse_buttons );
             else if ( key == "autobot.enabled" )
                 parse_bool( val, s.autobot_enabled );
+            else if ( key == "autobot.target_accuracy" )
+                parse_float( s.autobot_target_accuracy );
             else if ( key == "autobot.aim_spread" )
                 parse_float( s.autobot_aim_spread );
             else if ( key == "autobot.curve_strength" )
@@ -362,6 +378,18 @@ namespace config {
                 parse_float( s.autobot_slider_laziness );
             else if ( key == "autobot.spinner_rpm" )
                 parse_float( s.autobot_spinner_rpm );
+            else if ( key == "autobot.startup_motion" )
+                parse_bool( val, s.autobot_startup_motion );
+            else if ( key == "autobot.break_motion" )
+                parse_bool( val, s.autobot_break_motion );
+            else if ( key == "autobot.energetic_dances" )
+                parse_bool( val, s.autobot_energetic_dances );
+            else if ( key == "autobot.gameplay_flow" )
+                parse_bool( val, s.autobot_gameplay_flow );
+            else if ( key == "autobot.startup_energy" )
+                parse_float( s.autobot_startup_energy );
+            else if ( key == "autobot.break_energy" )
+                parse_float( s.autobot_break_energy );
             else if ( key == "tap.enabled" )
                 parse_bool( val, s.tap_enabled );
             else if ( key == "tap.assist_window" )
@@ -384,7 +412,7 @@ namespace config {
         s.aim_strength = std::clamp( s.aim_strength, 5.f, 100.f );
         s.aim_radius = std::clamp( s.aim_radius, 1.1f, 4.f );
         s.aim_smoothing_ms = std::clamp( s.aim_smoothing_ms, 35.f, 180.f );
-        s.aim_max_correction = std::clamp( s.aim_max_correction, 0.1f, 1.25f );
+        s.aim_max_correction = std::clamp( s.aim_max_correction, 0.1f, 1.75f );
         s.aim_adaptation_strength = std::clamp( s.aim_adaptation_strength, 0.f, 100.f );
         s.relax_tap_style = std::clamp( s.relax_tap_style, 0, 1 );
         s.relax_primary_key = std::clamp( s.relax_primary_key, 0, 1 );
@@ -394,6 +422,7 @@ namespace config {
         s.relax_early_variation_ms = std::clamp( s.relax_early_variation_ms, -25, 0 );
         s.relax_late_variation_ms = std::clamp( s.relax_late_variation_ms, 0, 25 );
         s.relax_timing_drift_ms = std::clamp( s.relax_timing_drift_ms, 0, 8 );
+        s.autobot_target_accuracy=std::clamp(s.autobot_target_accuracy,85.f,100.f);
         return true;
     }
 

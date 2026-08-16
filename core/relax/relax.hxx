@@ -27,6 +27,28 @@ namespace relax {
 
     class c_relax {
     public:
+        struct scheduled_object_t {
+            bool valid = false;
+            int press_time = 0;
+            int release_time = 0;
+            int timing_variation_ms = 0;
+            int accuracy_timing_ms = 0;
+            int simulated_grade = 300;
+            float accuracy_edge_bias = 0.f;
+            int key_index = 0;
+            tap_style_state_t tap_state = tap_style_state_t::singletap;
+        };
+
+        // Read-only snapshot of the Target Accuracy controller for diagnostics.
+        struct accuracy_telemetry_t {
+            bool active = false;
+            float target = 100.f;
+            float predicted = 100.f;      // projected final osu! accuracy (%)
+            uint64_t objects = 0;         // objects scheduled so far
+            uint64_t controlled_100 = 0;  // isolated 100s the controller placed
+            float debt = 0.f;             // outstanding deficit, in 100-equivalents
+        };
+
         bool enabled = true;
 
         float ur = 70.f;
@@ -68,6 +90,37 @@ namespace relax {
             return enabled && m_in_play && !m_click_queue.empty( );
         }
 
+        [[nodiscard]] bool scheduled_object(
+            size_t object_index, scheduled_object_t& out ) const {
+            std::lock_guard lock( m_mtx );
+            if ( object_index >= m_scheduled_objects.size( ) ||
+                 !m_scheduled_objects[ object_index ].valid )
+                return false;
+            out = m_scheduled_objects[ object_index ];
+            return true;
+        }
+
+        [[nodiscard]] double prepared_game_time( ) const {
+            std::lock_guard lock( m_mtx );
+            return m_prepared_game_time;
+        }
+
+        [[nodiscard]] accuracy_telemetry_t accuracy_telemetry( ) const {
+            std::lock_guard lock( m_mtx );
+            accuracy_telemetry_t t{};
+            t.active = m_autobot_accuracy_mode && m_in_play;
+            t.target = m_autobot_target_accuracy;
+            t.objects = m_acc_objects;
+            t.controlled_100 = m_acc_controlled_100;
+            t.predicted = m_acc_objects
+                ? static_cast<float>( ( 1.0 - m_acc_loss / static_cast<double>( m_acc_objects ) ) * 100.0 )
+                : 100.f;
+            const double f = std::clamp( m_autobot_target_accuracy, 85.f, 100.f ) / 100.0;
+            const double deficit = ( 1.0 - f ) * static_cast<double>( m_acc_objects ) - m_acc_loss;
+            t.debt = static_cast<float>( deficit / k_loss_100 );
+            return t;
+        }
+
         void on_leave_play( const osu::game_snapshot_t& game ) {
             std::lock_guard lock( m_mtx );
             leave_play( game );
@@ -77,6 +130,7 @@ namespace relax {
         void leave_play( const osu::game_snapshot_t& game ) {
             release_all_keys( game );
             m_click_queue.clear( );
+            m_scheduled_objects.clear( );
             m_last_hit_obj_idx = -1;
             m_scheduled_through_idx = -1;
             m_last_click_time = -99999;
@@ -84,15 +138,44 @@ namespace relax {
             reset_tap_controller( );
             m_last_audio_time = 0;
             m_last_audio_sync_time = 0.0;
+            m_prepared_game_time = 0.0;
             m_last_jitter = 0.f;
             reset_timing_drift( );
+            m_acc_loss=0.0;m_acc_objects=0;m_acc_controlled_100=0;m_accuracy_cooldown=0;
         }
 
     public:
 
         void update( const osu::game_snapshot_t& game, const osu::beatmap_data_t& map ) {
             std::lock_guard lock( m_mtx );
-            if ( !enabled || game.cur_state != osu::game_state_t::play || !map.loaded || map.objects.empty( ) ) {
+            m_autobot_accuracy_mode = false;
+            update_locked( game, map, false, true );
+        }
+
+        // Autobot shares this exact scheduler and key controller.  Preparation is
+        // separated from the one output flush so movement can be emitted first at
+        // the final scheduled timestamp.  Standalone Relax still uses update().
+        void prepare_for_autobot( const osu::game_snapshot_t& game, const osu::beatmap_data_t& map,
+                                  float target_accuracy = 100.f ) {
+            std::lock_guard lock( m_mtx );
+            m_autobot_accuracy_mode = true;
+            m_autobot_target_accuracy = std::clamp( target_accuracy, 85.f, 100.f );
+            update_locked( game, map, true, false );
+            if ( m_in_play )
+                m_prepared_game_time = get_interpolated_game_time( game );
+        }
+
+        void flush_for_autobot( const osu::game_snapshot_t& game ) {
+            std::lock_guard lock( m_mtx );
+            if ( m_in_play )
+                flush_queue_at( game, m_prepared_game_time );
+        }
+
+    private:
+        void update_locked( const osu::game_snapshot_t& game, const osu::beatmap_data_t& map,
+                            bool force_enabled, bool flush_output ) {
+            if ( ( !enabled && !force_enabled ) || game.cur_state != osu::game_state_t::play ||
+                 !map.loaded || map.objects.empty( ) ) {
                 if ( m_in_play )
                     leave_play( game );
                 return;
@@ -111,10 +194,10 @@ namespace relax {
 
             advance_past_objects( game, map );
             purge_stale( game_time );
-            flush_queue( game );
+            if ( flush_output )
+                flush_queue( game );
         }
 
-    private:
         struct scheduled_click_t {
             int press_time = 0;
             int release_time = 0;
@@ -125,6 +208,7 @@ namespace relax {
         };
 
         std::vector<scheduled_click_t> m_click_queue;
+        std::vector<scheduled_object_t> m_scheduled_objects;
         bool m_in_play = false;
         int m_last_game_time = 0;
         int m_last_hit_obj_idx = -1;
@@ -140,12 +224,24 @@ namespace relax {
         bool m_right_down = false;
         int m_last_audio_time = 0;
         double m_last_audio_sync_time = 0.0;
+        double m_prepared_game_time = 0.0;
         float m_last_jitter = 0.f;
         float m_timing_drift = 0.f;
         float m_timing_drift_target = 0.f;
         int m_timing_drift_last_time = 0;
         int m_timing_drift_next_target_time = 0;
         bool m_timing_drift_initialized = false;
+        bool m_autobot_accuracy_mode = false;
+        float m_autobot_target_accuracy = 100.f;
+        // Target Accuracy debt controller state (autobot-accuracy mode only).
+        double m_acc_loss = 0.0;            // Σ accuracy loss actually planned
+        uint64_t m_acc_objects = 0;         // objects scheduled (denominator)
+        uint64_t m_acc_controlled_100 = 0;  // controlled 100 outcomes placed
+        int m_accuracy_cooldown = 0;        // objects to skip after a controlled 100
+
+        static constexpr double k_loss_100 = 2.0 / 3.0;   // loss of one 100 vs a 300
+        static constexpr int k_accuracy_min_spacing = 3;  // min objects between 100s
+        static constexpr int k_accuracy_min_gap_ms = 170; // min neighbour spacing for a safe 100
 
         c_nt_input m_nt;
 
@@ -241,6 +337,7 @@ namespace relax {
         void reset_state( const osu::game_snapshot_t& game ) {
             release_all_keys( game );
             m_click_queue.clear( );
+            m_scheduled_objects.clear( );
             m_last_hit_obj_idx = -1;
             m_scheduled_through_idx = -1;
             m_last_click_time = -99999;
@@ -249,6 +346,7 @@ namespace relax {
             m_last_audio_sync_time = 0.0;
             m_last_jitter = 0.f;
             reset_timing_drift( );
+            m_acc_loss=0.0;m_acc_objects=0;m_acc_controlled_100=0;m_accuracy_cooldown=0;
         }
 
         void release_all_keys( const osu::game_snapshot_t& game ) {
@@ -489,6 +587,8 @@ namespace relax {
         void schedule_clicks( const osu::game_snapshot_t& game, const osu::beatmap_data_t& map ) {
             WORD k1 = 0, k2 = 0;
             resolve_keys( game, k1, k2 );
+            if ( m_scheduled_objects.size( ) < map.objects.size( ) )
+                m_scheduled_objects.resize( map.objects.size( ) );
 
             int current_stream_length = 0;
             int last_obj_start_time = -99999;
@@ -520,8 +620,58 @@ namespace relax {
 
                 const int base_press_time = obj.start_time + manual_offset_ms;
                 int press_time = base_press_time + applied_variation;
+                int accuracy_timing_ms = 0;
+                int simulated_grade = 300;
+                float accuracy_edge_bias = 0.f;
 
-                if ( timing_variation && m_last_click_time > -99999 ) {
+                // Target Accuracy (private-server simulated performance).  This is an
+                // input to the existing shared schedule, not a second timing engine.
+                // A debt-based integral controller drives the long-run osu! accuracy
+                // toward the requested value: each object adds an expected loss of
+                // (1 - target) to the debt, and when the debt reaches half of one
+                // 100's worth the controller spends it on the next SUITABLE, well
+                // spaced circle, placing that press firmly inside the map's 100 window
+                // (never on the 300/100 boundary, never in a stream where the ordering
+                // guard would clobber it).  Because the debt counts every object but is
+                // only spent on circles, slider/spinner dilution is handled exactly.
+                // Standalone Relax never enters this branch and keeps identical timing.
+                const bool circle = (obj.type & 1) != 0 && (obj.type & 2) == 0 && (obj.type & 8) == 0;
+                bool controlled_100 = false;
+                if ( m_autobot_accuracy_mode && m_autobot_target_accuracy < 99.999f ) {
+                    int next_start_gap = 100000;
+                    if ( i + 1 < static_cast<int>( map.objects.size( ) ) )
+                        next_start_gap = map.objects[ static_cast<size_t>( i + 1 ) ].start_time - obj.start_time;
+                    const bool suitable = circle && prev_interval >= k_accuracy_min_gap_ms &&
+                        next_start_gap >= k_accuracy_min_gap_ms;
+                    const double f = std::clamp( m_autobot_target_accuracy, 85.f, 100.f ) / 100.0;
+                    const double desired_loss = ( 1.0 - f ) * static_cast<double>( m_acc_objects );
+                    const double deficit = desired_loss - m_acc_loss;
+                    const bool want = deficit >= k_loss_100 * 0.5;
+                    if ( want && suitable && m_accuracy_cooldown <= 0 ) {
+                        float actual_od = map.od;
+                        if ( map.hr ) actual_od = std::min( 10.f, actual_od * 1.4f );
+                        if ( map.ez ) actual_od *= 0.5f;
+                        const float window_300 = std::max( 5.f, 79.5f - 6.f * actual_od );
+                        const float window_100 = std::max( window_300 + 4.f, 139.5f - 8.f * actual_od );
+                        const float lo = window_300 + 3.f;
+                        const float hi = std::max( lo + 1.f, window_100 - 4.f );
+                        const float magnitude = lo + m_unit( m_rng ) * ( hi - lo );
+                        const float sign = m_unit( m_rng ) < 0.5f ? -1.f : 1.f;
+                        int signed_offset = static_cast<int>( std::round( sign * magnitude ) );
+                        // an early controlled press must never cross the previous hit
+                        if ( sign < 0.f && obj.start_time + signed_offset <= m_last_click_time + 1 )
+                            signed_offset = static_cast<int>( std::round( magnitude ) );
+                        press_time = obj.start_time + signed_offset;
+                        accuracy_timing_ms = signed_offset;
+                        simulated_grade = 100;
+                        accuracy_edge_bias = 0.62f + m_unit( m_rng ) * 0.28f;
+                        controlled_100 = true;
+                        m_accuracy_cooldown = k_accuracy_min_spacing;
+                    }
+                    else if ( m_accuracy_cooldown > 0 ) m_accuracy_cooldown--;
+                }
+
+                if ( (timing_variation||m_autobot_accuracy_mode) && m_last_click_time > -99999 ) {
                     if ( base_press_time > m_last_click_time ) {
                         // If the existing scheduler order was valid, variation may approach
                         // the previous hit but may never cross it.
@@ -534,6 +684,10 @@ namespace relax {
                     }
                     applied_variation = press_time - base_press_time;
                 }
+
+                m_acc_loss += ( simulated_grade == 300 ) ? 0.0 : k_loss_100;
+                m_acc_objects++;
+                if ( controlled_100 ) m_acc_controlled_100++;
 
                 const bool is_slider = ( obj.type & 2 ) != 0;
                 const bool is_spinner = ( obj.type & 8 ) != 0;
@@ -597,6 +751,10 @@ namespace relax {
 
                 m_click_queue.push_back( {
                     press_time, release_time, applied_variation, chosen, false, false } );
+                m_scheduled_objects[ static_cast<size_t>( i ) ] = {
+                    true, press_time, release_time, applied_variation,
+                    accuracy_timing_ms, simulated_grade, accuracy_edge_bias,
+                    chosen_key_index, m_tap_state };
                 m_last_click_time = press_time;
                 m_scheduled_through_idx = i;
             }
@@ -627,7 +785,10 @@ namespace relax {
         }
 
         void flush_queue( const osu::game_snapshot_t& game ) {
-            const double est_gt = get_interpolated_game_time( game );
+            flush_queue_at( game, get_interpolated_game_time( game ) );
+        }
+
+        void flush_queue_at( const osu::game_snapshot_t& game, double est_gt ) {
             WORD k1 = 0, k2 = 0;
             resolve_keys( game, k1, k2 );
 

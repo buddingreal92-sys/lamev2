@@ -13,6 +13,7 @@
 #include <ShlObj.h>
 #include <shobjidl.h>
 #include <algorithm>
+#include <array>
 #include <random>
 #include <cstring>
 
@@ -55,11 +56,6 @@ namespace {
         return overlay->tap( ).handle_key_event( vk, is_down, press_qpc );
     }
 
-    inline float& hover_anim( uint64_t key ) {
-        static std::unordered_map<uint64_t, float> anims;
-        return anims[ key ];
-    }
-
     enum ACCENT_STATE {
         ACCENT_DISABLED = 0,
         ACCENT_ENABLE_GRADIENT = 1,
@@ -84,14 +80,18 @@ namespace {
         int Reserved;
     };
 
-    inline void enable_acrylic( HWND hwnd ) {
+    inline void enable_backdrop_blur( HWND hwnd ) {
         HMODULE user32 = GetModuleHandleW( L"user32.dll" );
         if ( !user32 ) return;
         auto SetWindowCompositionAttribute = reinterpret_cast<BOOL (WINAPI*)( HWND, WINCOMPATTRDATA* )>(
             GetProcAddress( user32, "SetWindowCompositionAttribute" ) );
         if ( !SetWindowCompositionAttribute ) return;
 
-        ACCENT_POLICY policy = { ACCENT_ENABLE_BLURBEHIND, 0, 0x00000000, 0 };
+        // Classic (non-acrylic) blur-behind: substantially weaker than the
+        // previous ACCENT_ENABLE_ACRYLICBLURBEHIND treatment, so the game
+        // behind the overlay stays recognizable and roughly readable. The
+        // menu draws its own translucent dim layer for foreground contrast.
+        ACCENT_POLICY policy = { ACCENT_ENABLE_BLURBEHIND, 0, 0, 0 };
         WINCOMPATTRDATA data = { 19, &policy, sizeof( policy ), 0 };
         SetWindowCompositionAttribute( hwnd, &data );
 
@@ -99,78 +99,157 @@ namespace {
         DwmExtendFrameIntoClientArea( hwnd, &margins );
     }
 
+    // 2px desaturated spectrum strip along the very top edge of the menu
     inline void draw_rgb_strip( ImDrawList* dl, const ImVec2& p0, float width, float time_seconds ) {
-        constexpr int segments = 72;
-        constexpr float height = 3.f;
-        const float phase = std::fmod( time_seconds * 0.035f, 1.f );
+        constexpr int segments = 48;
+        constexpr float height = 2.f;
+        const float phase = std::fmod( time_seconds * 0.03f, 1.f );
+        const int strip_a = static_cast<int>( 230.f * ui::theme::menu_alpha );
         for ( int i = 0; i < segments; ++i ) {
             const float t0 = static_cast<float>( i ) / static_cast<float>( segments );
             const float t1 = static_cast<float>( i + 1 ) / static_cast<float>( segments );
             ImVec4 c0{}, c1{};
-            ImGui::ColorConvertHSVtoRGB( std::fmod( t0 + phase, 1.f ), 0.88f, 0.92f, c0.x, c0.y, c0.z );
-            ImGui::ColorConvertHSVtoRGB( std::fmod( t1 + phase, 1.f ), 0.88f, 0.92f, c1.x, c1.y, c1.z );
+            ImGui::ColorConvertHSVtoRGB( std::fmod( t0 + phase, 1.f ), 0.72f, 0.82f, c0.x, c0.y, c0.z );
+            ImGui::ColorConvertHSVtoRGB( std::fmod( t1 + phase, 1.f ), 0.72f, 0.82f, c1.x, c1.y, c1.z );
             const float x0 = p0.x + width * t0;
             const float x1 = p0.x + width * t1 + 1.f;
-            const ImU32 u0 = ImGui::ColorConvertFloat4ToU32( ImVec4( c0.x, c0.y, c0.z, 1.f ) );
-            const ImU32 u1 = ImGui::ColorConvertFloat4ToU32( ImVec4( c1.x, c1.y, c1.z, 1.f ) );
+            const ImU32 u0 = ImGui::ColorConvertFloat4ToU32( ImVec4( c0.x, c0.y, c0.z, strip_a / 255.f ) );
+            const ImU32 u1 = ImGui::ColorConvertFloat4ToU32( ImVec4( c1.x, c1.y, c1.z, strip_a / 255.f ) );
             dl->AddRectFilledMultiColor( ImVec2( x0, p0.y ), ImVec2( x1, p0.y + height ), u0, u1, u1, u0 );
         }
     }
 
-    inline void draw_sidebar_icon( ImDrawList* dl, int icon, ImVec2 c, ImU32 color ) {
-        constexpr float r = 13.f;
-        constexpr float pi2 = 6.2831853f;
+    // very quiet ambient drift behind the content: 24 dim motes, occasional
+    // faint constellation line when two motes pass close to each other
+    inline void draw_ambient_particles( ImDrawList* dl, const ImVec2& p0, const ImVec2& p1, float dt, float time ) {
+        struct particle_t { float x, y, vx, vy, phase, neutral; };
+        constexpr int N = 24;
+        static std::array<particle_t, N> particles = [] {
+            std::array<particle_t, N> out{};
+            uint32_t seed = 0x51a7d2b9u;
+            auto next = [&]{ seed = seed * 1664525u + 1013904223u; return ( seed >> 8 ) & 0xffffu; };
+            for ( auto& p : out ) {
+                p.x = next( ) / 65535.f;
+                p.y = next( ) / 65535.f;
+                p.vx = 0.004f + ( next( ) / 65535.f ) * 0.010f;
+                p.vy = -0.006f + ( next( ) / 65535.f ) * 0.012f;
+                p.phase = ( next( ) / 65535.f ) * 6.283f;
+                p.neutral = ( next( ) & 1 ) ? 1.f : 0.f;
+            }
+            return out;
+        }( );
+
+        const float w = p1.x - p0.x, h = p1.y - p0.y;
+        const float fade = ui::theme::menu_alpha;
+        ImVec2 pts[ N ];
+        float vis[ N ];
+        for ( int i = 0; i < N; ++i ) {
+            auto& p = particles[ i ];
+            p.x += p.vx * dt; p.y += p.vy * dt;
+            if ( p.x > 1.02f ) p.x = -0.02f;
+            if ( p.y < -0.02f ) p.y = 1.02f;
+            if ( p.y > 1.02f ) p.y = -0.02f;
+            pts[ i ] = ImVec2( p0.x + p.x * w, p0.y + p.y * h );
+            vis[ i ] = 0.30f + 0.70f * ( std::sin( time * 0.55f + p.phase ) * 0.5f + 0.5f );
+            const int a = static_cast<int>( ( 6.f + 10.f * vis[ i ] ) * fade );
+            const ImU32 col = p.neutral > 0.5f
+                ? IM_COL32( 168, 164, 182, a )
+                : IM_COL32( 152, 68, 224, a );
+            dl->AddCircleFilled( pts[ i ], p.neutral > 0.5f ? 1.f : 1.3f, col, 6 );
+        }
+        constexpr float link_d = 64.f;
+        for ( int i = 0; i < N; ++i ) {
+            for ( int j = i + 1; j < N; ++j ) {
+                const float dx = pts[ i ].x - pts[ j ].x, dy = pts[ i ].y - pts[ j ].y;
+                const float d2 = dx * dx + dy * dy;
+                if ( d2 > link_d * link_d ) continue;
+                const float closeness = 1.f - std::sqrt( d2 ) / link_d;
+                const int a = static_cast<int>( 9.f * closeness * vis[ i ] * vis[ j ] * fade );
+                if ( a <= 1 ) continue;
+                dl->AddLine( pts[ i ], pts[ j ], IM_COL32( 150, 90, 210, a ), 1.f );
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // navigation icon family — one language: 1.6f strokes, ~18px optical
+    // box, geometric, no fills except small emphasis dots
+    // ------------------------------------------------------------------
+    inline void draw_nav_icon( ImDrawList* dl, int icon, ImVec2 c, ImU32 col ) {
+        constexpr float sw = 1.6f;
         switch ( icon ) {
-            case 0: // aim
-                dl->AddCircle( c, 10.f, color, 28, 2.f );
-                dl->AddCircleFilled( c, 2.5f, color, 12 );
-                dl->AddLine( ImVec2( c.x - r, c.y ), ImVec2( c.x - 6.f, c.y ), color, 2.f );
-                dl->AddLine( ImVec2( c.x + 6.f, c.y ), ImVec2( c.x + r, c.y ), color, 2.f );
-                dl->AddLine( ImVec2( c.x, c.y - r ), ImVec2( c.x, c.y - 6.f ), color, 2.f );
-                dl->AddLine( ImVec2( c.x, c.y + 6.f ), ImVec2( c.x, c.y + r ), color, 2.f );
+            case 0: { // aim — crosshair
+                dl->AddCircle( c, 6.5f, col, 24, sw );
+                dl->AddCircleFilled( c, 1.7f, col, 10 );
+                dl->AddLine( ImVec2( c.x - 9.5f, c.y ), ImVec2( c.x - 5.f, c.y ), col, sw );
+                dl->AddLine( ImVec2( c.x + 5.f, c.y ), ImVec2( c.x + 9.5f, c.y ), col, sw );
+                dl->AddLine( ImVec2( c.x, c.y - 9.5f ), ImVec2( c.x, c.y - 5.f ), col, sw );
+                dl->AddLine( ImVec2( c.x, c.y + 5.f ), ImVec2( c.x, c.y + 9.5f ), col, sw );
                 break;
-            case 1: // relax / slider
-                dl->AddBezierCubic( ImVec2( c.x - 13.f, c.y + 7.f ), ImVec2( c.x - 7.f, c.y - 14.f ),
-                    ImVec2( c.x + 7.f, c.y + 14.f ), ImVec2( c.x + 13.f, c.y - 7.f ), color, 3.f, 24 );
-                dl->AddCircleFilled( ImVec2( c.x - 13.f, c.y + 7.f ), 3.f, color, 12 );
-                dl->AddCircleFilled( ImVec2( c.x + 13.f, c.y - 7.f ), 3.f, color, 12 );
+            }
+            case 1: { // relax — two keys, left one pressed
+                dl->AddRectFilled( ImVec2( c.x - 9.f, c.y - 2.5f ), ImVec2( c.x - 1.f, c.y + 5.5f ), col, 2.f );
+                dl->AddRect( ImVec2( c.x + 1.f, c.y - 5.5f ), ImVec2( c.x + 9.f, c.y + 2.5f ), col, 2.f, 0, sw );
                 break;
-            case 2: // tap assist
-                dl->AddCircle( ImVec2( c.x - 6.f, c.y ), 7.f, color, 20, 2.f );
-                dl->AddCircle( ImVec2( c.x + 6.f, c.y ), 7.f, color, 20, 2.f );
-                dl->AddCircleFilled( ImVec2( c.x - 6.f, c.y ), 2.f, color, 10 );
-                dl->AddCircleFilled( ImVec2( c.x + 6.f, c.y ), 2.f, color, 10 );
+            }
+            case 2: { // tap assist — timing pulse
+                const ImVec2 pts[ 6 ] = {
+                    ImVec2( c.x - 9.f, c.y + 1.5f ), ImVec2( c.x - 4.5f, c.y + 1.5f ),
+                    ImVec2( c.x - 2.f, c.y - 5.5f ), ImVec2( c.x + 1.f, c.y + 6.f ),
+                    ImVec2( c.x + 3.f, c.y + 1.5f ), ImVec2( c.x + 9.f, c.y + 1.5f ) };
+                dl->AddPolyline( pts, 6, col, 0, sw );
                 break;
-            case 3: // replay
-                dl->PathArcTo( c, 11.f, -2.7f, 2.4f, 24 );
-                dl->PathStroke( color, 0, 2.5f );
-                dl->AddTriangleFilled( ImVec2( c.x - 11.f, c.y - 4.f ), ImVec2( c.x - 4.f, c.y - 6.f ),
-                    ImVec2( c.x - 7.f, c.y + 1.f ), color );
-                dl->AddTriangleFilled( ImVec2( c.x - 3.f, c.y - 6.f ), ImVec2( c.x + 8.f, c.y ),
-                    ImVec2( c.x - 3.f, c.y + 6.f ), color );
+            }
+            case 3: { // replay — circular arrow + play tip
+                dl->PathArcTo( c, 7.f, -2.4f, 2.6f, 20 );
+                dl->PathStroke( col, 0, sw );
+                const float tip_a = -2.4f;
+                const ImVec2 tip( c.x + 7.f * std::cos( tip_a ), c.y + 7.f * std::sin( tip_a ) );
+                dl->AddTriangleFilled(
+                    ImVec2( tip.x - 3.4f, tip.y - 1.6f ),
+                    ImVec2( tip.x + 1.6f, tip.y - 3.4f ),
+                    ImVec2( tip.x + 1.2f, tip.y + 2.2f ), col );
+                dl->AddTriangleFilled(
+                    ImVec2( c.x - 1.8f, c.y - 3.f ),
+                    ImVec2( c.x + 3.2f, c.y ),
+                    ImVec2( c.x - 1.8f, c.y + 3.f ), col );
                 break;
-            case 4: // autobot
+            }
+            case 4: { // autobot — automation path: start node → curve → arrow
+                dl->AddCircleFilled( ImVec2( c.x - 7.f, c.y + 6.f ), 2.f, col, 10 );
+                dl->AddBezierCubic(
+                    ImVec2( c.x - 7.f, c.y + 6.f ), ImVec2( c.x - 2.f, c.y - 8.f ),
+                    ImVec2( c.x + 3.f, c.y + 8.f ), ImVec2( c.x + 7.5f, c.y - 4.5f ), col, sw, 16 );
+                dl->AddTriangleFilled(
+                    ImVec2( c.x + 4.6f, c.y - 5.2f ),
+                    ImVec2( c.x + 10.f, c.y - 7.4f ),
+                    ImVec2( c.x + 8.6f, c.y - 1.6f ), col );
+                break;
+            }
+            case 5: { // system — gear
                 for ( int i = 0; i < 8; ++i ) {
-                    const float a = pi2 * static_cast<float>( i ) / 8.f;
-                    dl->AddLine( ImVec2( c.x + std::cos( a ) * 9.f, c.y + std::sin( a ) * 9.f ),
-                        ImVec2( c.x + std::cos( a ) * 14.f, c.y + std::sin( a ) * 14.f ), color, 3.f );
+                    const float a = 6.2831853f * static_cast<float>( i ) / 8.f + 0.3927f;
+                    dl->AddLine(
+                        ImVec2( c.x + std::cos( a ) * 5.5f, c.y + std::sin( a ) * 5.5f ),
+                        ImVec2( c.x + std::cos( a ) * 8.5f, c.y + std::sin( a ) * 8.5f ), col, 2.2f );
                 }
-                dl->AddCircle( c, 9.f, color, 24, 3.f );
-                dl->AddCircleFilled( c, 3.f, color, 12 );
+                dl->AddCircle( c, 5.5f, col, 20, sw );
+                dl->AddCircleFilled( c, 1.8f, col, 10 );
                 break;
-            case 5: // system
-                for ( int i = -1; i <= 1; ++i ) {
-                    const float y = c.y + static_cast<float>( i ) * 8.f;
-                    dl->AddLine( ImVec2( c.x - 14.f, y ), ImVec2( c.x + 14.f, y ), color, 2.f );
-                    const float knob = c.x + static_cast<float>( i ) * 6.f;
-                    dl->AddCircleFilled( ImVec2( knob, y ), 3.5f, color, 12 );
-                }
+            }
+            case 6: { // config — document with folded corner
+                const float x0 = c.x - 6.f, y0 = c.y - 8.f, x1 = c.x + 6.f, y1 = c.y + 8.f;
+                const float fold = 4.f;
+                const ImVec2 outline[ 5 ] = {
+                    ImVec2( x0, y0 ), ImVec2( x1 - fold, y0 ), ImVec2( x1, y0 + fold ),
+                    ImVec2( x1, y1 ), ImVec2( x0, y1 ) };
+                dl->AddPolyline( outline, 5, col, ImDrawFlags_Closed, sw );
+                dl->AddLine( ImVec2( x1 - fold, y0 ), ImVec2( x1 - fold, y0 + fold ), col, 1.2f );
+                dl->AddLine( ImVec2( x1 - fold, y0 + fold ), ImVec2( x1, y0 + fold ), col, 1.2f );
+                dl->AddLine( ImVec2( x0 + 3.f, c.y - 1.f ), ImVec2( x1 - 3.f, c.y - 1.f ), col, 1.2f );
+                dl->AddLine( ImVec2( x0 + 3.f, c.y + 3.f ), ImVec2( x1 - 5.f, c.y + 3.f ), col, 1.2f );
                 break;
-            case 6: // config / profile
-                dl->AddCircleFilled( ImVec2( c.x, c.y - 7.f ), 7.f, color, 20 );
-                dl->AddBezierCubic( ImVec2( c.x - 13.f, c.y + 13.f ), ImVec2( c.x - 12.f, c.y + 1.f ),
-                    ImVec2( c.x + 12.f, c.y + 1.f ), ImVec2( c.x + 13.f, c.y + 13.f ), color, 8.f, 20 );
-                break;
+            }
         }
     }
 
@@ -197,7 +276,7 @@ namespace ui {
 
         if ( !m_hwnd ) return false;
 
-        enable_acrylic( m_hwnd );
+        enable_backdrop_blur( m_hwnd );
         SetLayeredWindowAttributes( m_hwnd, 0, 255, LWA_ALPHA );
 
         ShowWindow( m_hwnd, SW_SHOWDEFAULT );
@@ -210,34 +289,52 @@ namespace ui {
         ImGuiIO& io = ImGui::GetIO( );
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
+        // ------------------------------------------------------------------
+        // typography stack — regular / semibold / small / tiny-caps / brand /
+        // mono, each with a safe fallback if a system ttf is missing
+        // ------------------------------------------------------------------
         ImFontConfig font_cfg{};
-        font_cfg.OversampleH = 2;
-        font_cfg.OversampleV = 1;
-        font_cfg.PixelSnapH = false;
+        font_cfg.OversampleH = 3;
+        font_cfg.OversampleV = 2;
+        font_cfg.PixelSnapH = true;
         font_cfg.PixelSnapV = true;
-        io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\segoeui.ttf", 15.f, &font_cfg );
+        theme::font_base = io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\segoeui.ttf", 16.f, &font_cfg );
+        theme::font_bold = io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\segoeuib.ttf", 16.5f, &font_cfg );
+        theme::font_small = io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\segoeui.ttf", 12.f, &font_cfg );
+        theme::font_tiny = io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\segoeuib.ttf", 11.f, &font_cfg );
+        theme::font_brand = io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\segoeuib.ttf", 23.f, &font_cfg );
+        theme::font_mono = io.Fonts->AddFontFromFileTTF( "C:\\Windows\\Fonts\\consola.ttf", 13.f, &font_cfg );
+        if ( !theme::font_base ) theme::font_base = io.Fonts->AddFontDefault( );
+        if ( !theme::font_bold ) theme::font_bold = theme::font_base;
+        if ( !theme::font_small ) theme::font_small = theme::font_base;
+        if ( !theme::font_tiny ) theme::font_tiny = theme::font_small;
+        if ( !theme::font_brand ) theme::font_brand = theme::font_bold;
+        if ( !theme::font_mono ) theme::font_mono = theme::font_small;
+        io.FontDefault = theme::font_base;
 
         ImGuiStyle& style = ImGui::GetStyle( );
         style.WindowRounding = 0.f;
         style.WindowBorderSize = 0.f;
-        style.ChildRounding = 0.f;
-        style.PopupRounding = 0.f;
-        style.FrameRounding = 0.f;
-        style.GrabRounding = 0.f;
-        style.ScrollbarRounding = 0.f;
-        style.FramePadding = ImVec2( 5.f, 3.f );
-        style.ItemSpacing = ImVec2( 4.f, 3.f );
+        style.ChildRounding = theme::control_rounding;
+        style.PopupRounding = 3.f;
+        style.FrameRounding = theme::control_rounding;
+        style.GrabRounding = theme::control_rounding;
+        style.ScrollbarRounding = 2.f;
+        style.FramePadding = ImVec2( 6.f, 3.f );
+        style.ItemSpacing = ImVec2( 5.f, 4.f );
         style.ScrollbarSize = 8.f;
-        style.Colors[ ImGuiCol_Text ] = ImVec4( 0.70f, 0.70f, 0.70f, 1.f );
-        style.Colors[ ImGuiCol_WindowBg ] = ImVec4( 0.05f, 0.05f, 0.05f, 1.f );
-        style.Colors[ ImGuiCol_ChildBg ] = ImVec4( 0.06f, 0.06f, 0.06f, 1.f );
-        style.Colors[ ImGuiCol_FrameBg ] = ImVec4( 0.09f, 0.09f, 0.09f, 1.f );
-        style.Colors[ ImGuiCol_FrameBgHovered ] = ImVec4( 0.13f, 0.13f, 0.13f, 1.f );
-        style.Colors[ ImGuiCol_Header ] = ImVec4( 0.36f, 0.03f, 0.50f, 0.55f );
-        style.Colors[ ImGuiCol_HeaderHovered ] = ImVec4( 0.45f, 0.04f, 0.62f, 0.65f );
-        style.Colors[ ImGuiCol_HeaderActive ] = ImVec4( 0.55f, 0.04f, 0.72f, 0.75f );
-        style.Colors[ ImGuiCol_ScrollbarBg ] = ImVec4( 0.04f, 0.04f, 0.04f, 1.f );
-        style.Colors[ ImGuiCol_ScrollbarGrab ] = ImVec4( 0.20f, 0.20f, 0.20f, 1.f );
+        style.Colors[ ImGuiCol_Text ] = ImVec4( 0.74f, 0.73f, 0.77f, 1.f );
+        style.Colors[ ImGuiCol_WindowBg ] = ImVec4( 0.05f, 0.05f, 0.06f, 1.f );
+        style.Colors[ ImGuiCol_ChildBg ] = ImVec4( 0.06f, 0.06f, 0.07f, 1.f );
+        style.Colors[ ImGuiCol_PopupBg ] = ImVec4( 0.08f, 0.08f, 0.10f, 0.98f );
+        style.Colors[ ImGuiCol_Border ] = ImVec4( 0.16f, 0.16f, 0.20f, 1.f );
+        style.Colors[ ImGuiCol_FrameBg ] = ImVec4( 0.09f, 0.09f, 0.11f, 1.f );
+        style.Colors[ ImGuiCol_FrameBgHovered ] = ImVec4( 0.13f, 0.13f, 0.16f, 1.f );
+        style.Colors[ ImGuiCol_Header ] = ImVec4( 0.38f, 0.13f, 0.56f, 0.55f );
+        style.Colors[ ImGuiCol_HeaderHovered ] = ImVec4( 0.46f, 0.17f, 0.66f, 0.65f );
+        style.Colors[ ImGuiCol_HeaderActive ] = ImVec4( 0.54f, 0.20f, 0.76f, 0.75f );
+        style.Colors[ ImGuiCol_ScrollbarBg ] = ImVec4( 0.04f, 0.04f, 0.05f, 1.f );
+        style.Colors[ ImGuiCol_ScrollbarGrab ] = ImVec4( 0.20f, 0.20f, 0.24f, 1.f );
 
         ImGui_ImplWin32_Init( m_hwnd );
         ImGui_ImplDX11_Init( m_device, m_context );
@@ -291,10 +388,20 @@ namespace ui {
     }
 
     void c_overlay::handle_hotkeys( ) {
-        const bool menu_down = ( GetAsyncKeyState( m_menu_keybind ) & 0x8000 ) != 0;
-        if ( menu_down && !m_menu_key_was_down )
-            m_visible = !m_visible;
+        // Strict edge detection: one physical press = exactly one toggle of
+        // the single logical state. Holding the key never re-toggles, and
+        // the animation below never writes m_visible.
+        const bool menu_down = m_menu_keybind > 0 &&
+            ( GetAsyncKeyState( m_menu_keybind ) & 0x8000 ) != 0;
+        const bool pressed = menu_down && !m_menu_key_was_down;
         m_menu_key_was_down = menu_down;
+
+        if ( !pressed ) return;
+        if ( m_waiting_menu ) return; // this press is being captured as the new bind
+
+        m_visible = !m_visible;
+        if ( !m_visible )
+            close_transient_ui( );
     }
 
     void c_overlay::update_overlay_position( ) {
@@ -334,7 +441,10 @@ namespace ui {
         const bool stream_proof_changed = prev_stream_proof != stream_proof;
         prev_stream_proof = stream_proof;
 
-        bool should_show = m_visible;
+        // Window stays alive through the whole close animation; input is
+        // released the moment the close is *requested* (WS_EX_TRANSPARENT)
+        // so fading-out controls can no longer be clicked.
+        const bool should_show = render_visible( );
 
         if ( should_show ) {
             LONG ex = GetWindowLongW( m_hwnd, GWL_EXSTYLE );
@@ -438,8 +548,8 @@ namespace ui {
         if ( m_snapshot_fn )
             snap = m_snapshot_fn( );
 
-        bool should_show = m_visible;
-        if ( !should_show ) {
+        if ( !render_visible( ) ) {
+            m_streamproof_hide_cursor = false;
             if ( m_context && m_rtv ) {
                 const float clear[ 4 ]{ 0.0f, 0.0f, 0.0f, 0.0f };
                 m_context->OMSetRenderTargets( 1, &m_rtv, nullptr );
@@ -453,27 +563,33 @@ namespace ui {
         ImGui_ImplWin32_NewFrame( );
         ImGui::NewFrame( );
 
-        const float dt = ImGui::GetIO( ).DeltaTime;
+        // Clamp dt for animation purposes: after the window was hidden for a
+        // while, the first frame's DeltaTime spans the whole hidden period and
+        // would otherwise snap every transition to its end state.
+        const float dt = std::min( ImGui::GetIO( ).DeltaTime, 1.f / 30.f );
         tick_animations( dt );
         m_anim_time = g_time;
 
-        if ( m_visible && !m_menu_was_open ) {
-            m_menu_open_anim = 0.f;
-            m_menu_was_open = true;
-        }
-        else if ( !m_visible && m_menu_was_open ) {
-            m_menu_was_open = false;
+        // Visual transition follows the logical state; it never writes it.
+        // ~150 ms open, ~120 ms close, frame-rate independent.
+        {
+            const float target = m_visible ? 1.f : 0.f;
+            const float rate = m_visible ? 13.f : 17.f;
+            m_menu_open_anim += ( target - m_menu_open_anim ) * std::min( dt * rate, 1.f );
+            if ( !m_visible && m_menu_open_anim <= 0.012f )
+                m_menu_open_anim = 0.f;
+            else if ( m_visible && m_menu_open_anim >= 0.998f )
+                m_menu_open_anim = 1.f;
         }
 
-        if ( m_visible ) {
-            m_menu_open_anim += ( 1.0f - m_menu_open_anim ) * std::min( dt * 6.0f, 1.0f );
-        }
+        theme::menu_alpha = std::min( m_menu_open_anim * 1.2f, 1.f );
+        theme::content_mul = 1.f;
 
-        if ( m_visible ) {
+        {
             ImDrawList* bg_dl = ImGui::GetBackgroundDrawList( );
             const ImVec2 disp = ImGui::GetIO( ).DisplaySize;
-            const float bg_a = m_menu_open_anim * 0.2f;
-            if ( bg_a > 0.01f ) {
+            const float bg_a = m_menu_open_anim * 0.12f;
+            if ( bg_a > 0.005f ) {
                 const int a = static_cast<int>( bg_a * 255 );
                 bg_dl->AddRectFilledMultiColor(
                     ImVec2( 0, 0 ), disp,
@@ -482,13 +598,8 @@ namespace ui {
             }
         }
 
-        if ( m_visible ) {
-            draw_menu( snap );
-            m_streamproof_hide_cursor = stream_proof && ( ImGui::GetIO( ).WantCaptureMouse );
-        }
-        else {
-            m_streamproof_hide_cursor = false;
-        }
+        draw_menu( snap );
+        m_streamproof_hide_cursor = m_visible && stream_proof && ( ImGui::GetIO( ).WantCaptureMouse );
 
         ImGui::Render( );
 
@@ -544,12 +655,19 @@ namespace ui {
         s.replay_parse_buttons = m_replay.parse_buttons;
 
         s.autobot_enabled = m_autobot.enabled;
+        s.autobot_target_accuracy = m_autobot.target_accuracy;
         s.autobot_aim_spread = m_autobot.aim_spread;
         s.autobot_curve_strength = m_autobot.curve_strength;
         s.autobot_drift_amount = m_autobot.drift_amount;
         s.autobot_momentum = m_autobot.momentum;
         s.autobot_slider_laziness = m_autobot.slider_laziness;
         s.autobot_spinner_rpm = m_autobot.spinner_rpm;
+        s.autobot_startup_motion = m_autobot.startup_motion;
+        s.autobot_break_motion = m_autobot.break_motion;
+        s.autobot_energetic_dances = m_autobot.energetic_dances;
+        s.autobot_gameplay_flow = m_autobot.gameplay_flow;
+        s.autobot_startup_energy = m_autobot.startup_energy;
+        s.autobot_break_energy = m_autobot.break_energy;
 
         s.tap_enabled = m_tap_assist.enabled;
         s.tap_assist_window = m_tap_assist.assist_window;
@@ -612,12 +730,19 @@ namespace ui {
         m_replay.parse_buttons = s.replay_parse_buttons;
 
         m_autobot.enabled = s.autobot_enabled;
+        m_autobot.target_accuracy = s.autobot_target_accuracy;
         m_autobot.aim_spread = s.autobot_aim_spread;
         m_autobot.curve_strength = s.autobot_curve_strength;
         m_autobot.drift_amount = s.autobot_drift_amount;
         m_autobot.momentum = s.autobot_momentum;
         m_autobot.slider_laziness = s.autobot_slider_laziness;
         m_autobot.spinner_rpm = s.autobot_spinner_rpm;
+        m_autobot.startup_motion = s.autobot_startup_motion;
+        m_autobot.break_motion = s.autobot_break_motion;
+        m_autobot.energetic_dances = s.autobot_energetic_dances;
+        m_autobot.gameplay_flow = s.autobot_gameplay_flow;
+        m_autobot.startup_energy = s.autobot_startup_energy;
+        m_autobot.break_energy = s.autobot_break_energy;
 
         m_tap_assist.enabled = s.tap_enabled;
         m_tap_assist.assist_window = s.tap_assist_window;
@@ -626,7 +751,7 @@ namespace ui {
 
         m_custom_left_key = s.custom_left_key;
         m_custom_right_key = s.custom_right_key;
-        m_menu_keybind = s.menu_keybind;
+        m_menu_keybind = ( s.menu_keybind > 0 && s.menu_keybind < 256 ) ? s.menu_keybind : VK_DELETE;
         stream_proof = s.stream_proof;
 
 
@@ -725,9 +850,20 @@ namespace ui {
             if ( !map_paused )
                 m_aim.update( mod_game, beatmap );
 
-            m_relax.update( mod_game, beatmap );
+            // Autobot and standalone Relax have exactly one press/release owner.
+            // When Autobot is active, prepare the shared schedule first, move the
+            // cursor, then flush that same queue so the arrival precedes the press.
+            if ( m_autobot.enabled )
+                m_relax.prepare_for_autobot( mod_game, beatmap, m_autobot.target_accuracy );
+            else
+                m_relax.update( mod_game, beatmap );
             m_replay.update( mod_game, beatmap, map_paused );
-            m_autobot.update( mod_game, beatmap, map_paused );
+            if ( m_autobot.enabled ) {
+                m_autobot.update( mod_game, beatmap, m_relax, map_paused );
+                m_relax.flush_for_autobot( mod_game );
+            }
+            else
+                m_autobot.update( mod_game, beatmap, m_relax, map_paused );
             m_tap_assist.update( mod_game, beatmap );
         }
         else {
@@ -743,30 +879,39 @@ namespace ui {
         }
     }
 
+
     void c_overlay::draw_menu( const osu::full_snapshot_t& snap ) {
         update_bind_capture( );
 
         ImGuiIO& io = ImGui::GetIO( );
 
-        static const float MENU_W = 820.f;
-        static const float MENU_H = 620.f;
-        static const float SIDEBAR_W = 86.f;
-        static const float TITLE_H = 24.f;
-        static const float PADDING = 12.f;
-        static const float L_X = SIDEBAR_W + PADDING;
-        static const float L_W = 342.f;
-        static const float GAP = 12.f;
-        static const float R_X = L_X + L_W + GAP;
-        static const float R_W = 356.f;
+        constexpr float W = static_cast<float>( MENU_W );
+        constexpr float H = static_cast<float>( MENU_H );
+        constexpr float SB_W = 96.f;     // navigation rail
+        constexpr float HDR_H = 38.f;    // header strip
+        constexpr float COL_W = 344.f;   // panel width (both columns)
+        constexpr float L_X = SB_W + 12.f;
+        constexpr float R_X = L_X + COL_W + 12.f;
+        constexpr float CW = COL_W - 28.f;   // control width inside a panel
 
-        const float scale = 1.0f;
-        const float alpha = std::min( m_menu_open_anim * 1.5f, 1.0f );
+        const float ease = theme::ease_out_cubic( m_menu_open_anim );
+        const float alpha = theme::menu_alpha;
 
-        float menu_x = ( io.DisplaySize.x - MENU_W ) * 0.5f + m_menu_offset_x;
-        float menu_y = ( io.DisplaySize.y - MENU_H ) * 0.5f + m_menu_offset_y;
+        // keep the menu reachable: never allow it to be dragged fully off-screen
+        {
+            const float base_x = ( io.DisplaySize.x - W ) * 0.5f;
+            const float base_y = ( io.DisplaySize.y - H ) * 0.5f;
+            m_menu_offset_x = std::clamp( m_menu_offset_x,
+                static_cast<int>( -base_x - W + 90.f ), static_cast<int>( io.DisplaySize.x - base_x - 90.f ) );
+            m_menu_offset_y = std::clamp( m_menu_offset_y,
+                static_cast<int>( -base_y ), static_cast<int>( io.DisplaySize.y - base_y - 60.f ) );
+        }
+
+        const float menu_x = ( io.DisplaySize.x - W ) * 0.5f + static_cast<float>( m_menu_offset_x );
+        const float menu_y = ( io.DisplaySize.y - H ) * 0.5f + static_cast<float>( m_menu_offset_y ) + ( 1.f - ease ) * 6.f;
 
         ImGui::SetNextWindowPos( ImVec2( menu_x, menu_y ), ImGuiCond_Always );
-        ImGui::SetNextWindowSize( ImVec2( MENU_W * scale, MENU_H * scale ), ImGuiCond_Always );
+        ImGui::SetNextWindowSize( ImVec2( W, H ), ImGuiCond_Always );
 
         ImGuiWindowFlags wf =
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
@@ -778,584 +923,622 @@ namespace ui {
         ImGui::PushStyleVar( ImGuiStyleVar_ItemSpacing, ImVec2( 0, 0 ) );
         ImGui::Begin( "##  ", nullptr, wf );
         ImGui::PopStyleVar( 2 );
+        ImGui::PushStyleVar( ImGuiStyleVar_Alpha, alpha );
 
         ImDrawList* dl = ImGui::GetWindowDrawList( );
         const ImVec2 wpos = ImGui::GetWindowPos( );
         const ImVec2 wsize = ImGui::GetWindowSize( );
         auto S = [&]( float x, float y ) { return ImVec2( wpos.x + x, wpos.y + y ); };
 
-        if ( alpha > 0.01f ) {
-            const ImVec2 br = ImVec2( wpos.x + wsize.x, wpos.y + wsize.y );
+        // ------------------------------------------------------------------
+        // window shell
+        // ------------------------------------------------------------------
+        const ImVec2 br = ImVec2( wpos.x + wsize.x, wpos.y + wsize.y );
+        dl->AddRectFilled( wpos, br, theme::fade( theme::window_bg() ) );
+        draw_ambient_particles( dl, wpos, br, g_delta_time, m_anim_time );
 
-            dl->AddRectFilled( wpos, br, theme::window_bg() );
-            dl->AddRect( wpos, br, IM_COL32( 55, 55, 55, static_cast<int>( 255 * alpha ) ), 0.f, 0, 1.0f );
-            draw_rgb_strip( dl, wpos, wsize.x, m_anim_time );
+        // navigation rail (drawn after particles so they live behind content only)
+        dl->AddRectFilled( ImVec2( wpos.x, wpos.y + 2.f ), ImVec2( wpos.x + SB_W, br.y ), theme::fade( theme::sidebar_bg() ) );
+        dl->AddLine( ImVec2( wpos.x + SB_W, wpos.y + 2.f ), ImVec2( wpos.x + SB_W, br.y ),
+            theme::fade( theme::border() ), 1.0f );
+
+        dl->AddRect( wpos, br, theme::fade( IM_COL32( 52, 51, 60, 255 ) ), 0.f, 0, 1.0f );
+        draw_rgb_strip( dl, wpos, wsize.x, m_anim_time );
+
+        // ------------------------------------------------------------------
+        // brand — lame(v2)
+        // ------------------------------------------------------------------
+        {
+            ImFont* bf = theme::font_brand;
+            ImFont* vf = theme::font_bold;
+            const float bw = bf->CalcTextSizeA( bf->LegacySize, FLT_MAX, 0.f, "lame" ).x;
+            const float vw = vf->CalcTextSizeA( vf->LegacySize, FLT_MAX, 0.f, "v2" ).x;
+            const float total = bw + 3.f + vw;
+            const float bx = wpos.x + ( SB_W - total ) * 0.5f;
+            const float by = wpos.y + 13.f;
+
+            dl->AddText( bf, bf->LegacySize, ImVec2( bx + 1.f, by + 2.f ), theme::fade( IM_COL32( 0, 0, 0, 150 ) ), "lame" );
+            dl->AddText( bf, bf->LegacySize, ImVec2( bx, by + 1.f ), theme::fade( theme::text_bright() ), "lame" );
+            dl->AddText( vf, vf->LegacySize, ImVec2( bx + bw + 3.f + 1.f, by + 1.f ), theme::fade( theme::accent_alpha( 0.35f ) ), "v2" );
+            dl->AddText( vf, vf->LegacySize, ImVec2( bx + bw + 3.f, by ), theme::fade( theme::accent_hot() ), "v2" );
+
+            // shimmer underline: a soft accent highlight drifting along a hairline
+            const float uy = by + bf->LegacySize + 4.f;
+            const float ux0 = wpos.x + 16.f, ux1 = wpos.x + SB_W - 16.f;
+            dl->AddLine( ImVec2( ux0, uy ), ImVec2( ux1, uy ), theme::fade( IM_COL32( 40, 39, 48, 255 ) ), 1.f );
+            const float sc = ux0 + ( ux1 - ux0 ) * ( 0.5f + 0.5f * std::sin( m_anim_time * 0.9f ) );
+            const float sw2 = 14.f;
+            dl->AddRectFilledMultiColor( ImVec2( sc - sw2, uy - 0.5f ), ImVec2( sc, uy + 0.5f ),
+                theme::fade( theme::accent_alpha( 0.0f ) ), theme::fade( theme::accent_alpha( 0.8f ) ),
+                theme::fade( theme::accent_alpha( 0.8f ) ), theme::fade( theme::accent_alpha( 0.0f ) ) );
+            dl->AddRectFilledMultiColor( ImVec2( sc, uy - 0.5f ), ImVec2( sc + sw2, uy + 0.5f ),
+                theme::fade( theme::accent_alpha( 0.8f ) ), theme::fade( theme::accent_alpha( 0.0f ) ),
+                theme::fade( theme::accent_alpha( 0.0f ) ), theme::fade( theme::accent_alpha( 0.8f ) ) );
         }
 
+        // ------------------------------------------------------------------
+        // navigation
+        // ------------------------------------------------------------------
         {
-            const ImVec2 sb_br = ImVec2( wpos.x + SIDEBAR_W, wpos.y + wsize.y );
-            dl->AddRectFilled( ImVec2( wpos.x + 1.f, wpos.y + 3.f ), sb_br, theme::sidebar_bg() );
-            dl->AddLine( ImVec2( wpos.x + SIDEBAR_W, wpos.y ), ImVec2( wpos.x + SIDEBAR_W, wpos.y + wsize.y ),
-                theme::border_bright(), 1.0f );
-        }
+            update_tab_transition( m_tab, g_delta_time );
 
-        {
-            const ImVec2 brand_c( wpos.x + SIDEBAR_W * 0.5f, wpos.y + 24.f );
-            dl->AddCircle( brand_c, 10.f, theme::text_dim(), 24, 1.5f );
-            dl->AddCircleFilled( brand_c, 3.f, theme::accent(), 12 );
-        }
+            static const char* tab_names[ ] = { "Aim Assist", "Relax", "Tap Assist", "Replay", "Autobot", "System", "Config" };
+            const bool module_on[ 7 ] = {
+                m_aim.enabled, m_relax.enabled, m_tap_assist.enabled,
+                m_replay.enabled, m_autobot.enabled, false, false };
+            const bool module_dot[ 7 ] = { true, true, true, true, true, false, false };
 
-        {
-            update_tab_transition( m_tab, io.DeltaTime );
+            const float nav_y0 = 64.f;
+            const float item_h = 52.f;
+            const float item_gap = 2.f;
 
-            static const char* tab_names[ ] = { "Aimbot", "Relax", "Tap Assist", "Replay", "Autobot", "System", "Config" };
-            const float tab_start_y = wpos.y + 48.0f;
-            const float tab_h = 76.0f;
-            const float tab_gap = 0.0f;
-
-            const ImVec2 mouse = ImGui::GetIO( ).MousePos;
+            const ImVec2 mouse = io.MousePos;
             const bool mouse_clicked = ImGui::IsMouseClicked( ImGuiMouseButton_Left );
 
-            float target_indicator_y = tab_start_y + static_cast<float>( m_tab ) * ( tab_h + tab_gap );
-            g_tab_indicator_y += ( target_indicator_y - g_tab_indicator_y ) * std::min( io.DeltaTime * 14.0f, 1.0f );
+            const float target_ind = wpos.y + nav_y0 + static_cast<float>( m_tab ) * ( item_h + item_gap );
+            if ( g_tab_indicator_y <= 0.f ) g_tab_indicator_y = target_ind;
+            g_tab_indicator_y = theme::approach( g_tab_indicator_y, target_ind, g_delta_time, 16.f );
 
             for ( int i = 0; i < 7; i++ ) {
-                const float tx = wpos.x + 1.0f;
-                const float ty = tab_start_y + static_cast<float>( i ) * ( tab_h + tab_gap );
-                const float tw = SIDEBAR_W - 1.0f;
+                const float ty = wpos.y + nav_y0 + static_cast<float>( i ) * ( item_h + item_gap );
+                const ImVec2 b0( wpos.x + 1.f, ty );
+                const ImVec2 b1( wpos.x + SB_W - 1.f, ty + item_h );
 
-                const ImVec2 btn_min = ImVec2( tx, ty );
-                const ImVec2 btn_max = ImVec2( tx + tw, ty + tab_h );
-
-                const bool hov = ( mouse.x >= btn_min.x && mouse.x <= btn_max.x && mouse.y >= btn_min.y && mouse.y <= btn_max.y );
+                const bool hov = m_visible &&
+                    mouse.x >= b0.x && mouse.x <= b1.x && mouse.y >= b0.y && mouse.y <= b1.y;
                 const bool active = ( i == m_tab );
+                if ( hov && mouse_clicked ) m_tab = i;
 
-                if ( hov && mouse_clicked ) {
-                    m_tab = i;
+                const float hovt = anim( 0x5AB000 + static_cast<ImGuiID>( i ), ( hov || active ) ? 1.f : 0.f, 13.f, 0.f );
+
+                if ( hovt > 0.01f ) {
+                    const ImU32 bg = active ? theme::tab_active_bg() : theme::tab_hover_bg();
+                    dl->AddRectFilled( b0, b1, theme::fade( theme::lerp_color( theme::sidebar_bg(), bg, hovt ) ) );
+                }
+                if ( active ) {
+                    dl->AddRectFilled( ImVec2( b0.x, g_tab_indicator_y + 10.f ),
+                        ImVec2( b0.x + 2.f, g_tab_indicator_y + item_h - 10.f ), theme::fade( theme::accent() ), 1.f );
                 }
 
-                float& anim = tab_hover_anim( i );
-                const float target = ( hov || active ) ? 1.0f : 0.0f;
-                anim += ( target - anim ) * std::min( io.DeltaTime * 12.0f, 1.0f );
+                const float shift = hovt * 1.f;
+                const ImVec2 ic( wpos.x + SB_W * 0.5f + shift, ty + 19.f );
+                const ImU32 ic_col = active ? theme::text_bright() : ( hov ? theme::text() : theme::text_dim() );
 
-                if ( anim > 0.01f )
-                    dl->AddRectFilled( btn_min, btn_max, active ? theme::tab_active_bg() : theme::tab_hover_bg() );
-                dl->AddLine( ImVec2( btn_min.x, btn_max.y ), btn_max, IM_COL32( 28, 28, 28, 255 ), 1.f );
-                if ( active )
-                    dl->AddRectFilled( ImVec2( btn_max.x - 3.f, btn_min.y ), btn_max, theme::accent() );
-
-                const float ic_x = btn_min.x + tw * 0.5f;
-                const float ic_y = btn_min.y + tab_h * 0.5f;
-                const ImU32 nav_col = active ? theme::text_bright() : ( hov ? theme::text() : theme::text_dim() );
-                const ImU32 ic_col = IM_COL32( 0, 0, 0, 0 );
-                const ImU32 ic_col_dim = IM_COL32( 0, 0, 0, 0 );
-                const float icon_scale = 1.0f;
-
-                switch ( i ) {
-                    case 0: {
-                        dl->AddCircle( ImVec2( ic_x, ic_y ), 6.0f * icon_scale, ic_col, 20, 1.5f );
-                        dl->AddCircleFilled( ImVec2( ic_x, ic_y ), 1.8f * icon_scale, ic_col, 12 );
-                        dl->AddLine( ImVec2( ic_x - 8.f, ic_y ), ImVec2( ic_x - 3.f, ic_y ), ic_col, 1.3f );
-                        dl->AddLine( ImVec2( ic_x + 3.f, ic_y ), ImVec2( ic_x + 8.f, ic_y ), ic_col, 1.3f );
-                        dl->AddLine( ImVec2( ic_x, ic_y - 8.f ), ImVec2( ic_x, ic_y - 3.f ), ic_col, 1.3f );
-                        dl->AddLine( ImVec2( ic_x, ic_y + 3.f ), ImVec2( ic_x, ic_y + 8.f ), ic_col, 1.3f );
-                        break;
-                    }
-                    case 1: {
-                        const float ww = 12.f;
-                        dl->AddBezierCubic(
-                            ImVec2( ic_x - ww * 0.5f, ic_y + 3.f ),
-                            ImVec2( ic_x - ww * 0.15f, ic_y - 5.f ),
-                            ImVec2( ic_x + ww * 0.15f, ic_y + 5.f ),
-                            ImVec2( ic_x + ww * 0.5f, ic_y - 3.f ),
-                            ic_col, 1.8f, 12 );
-                        dl->AddBezierCubic(
-                            ImVec2( ic_x - ww * 0.5f, ic_y + 3.f ),
-                            ImVec2( ic_x - ww * 0.15f, ic_y - 5.f ),
-                            ImVec2( ic_x + ww * 0.15f, ic_y + 5.f ),
-                            ImVec2( ic_x + ww * 0.5f, ic_y - 3.f ),
-                            ic_col_dim, 4.f, 12 );
-                        break;
-                    }
-                    case 2: {
-                        const float pulse2 = active ? breathe( 2.5f, 0.f, 1.5f ) : 0.f;
-                        dl->AddCircle( ImVec2( ic_x - 3.f, ic_y ), 3.5f + pulse2, ic_col, 12, 1.6f );
-                        dl->AddCircleFilled( ImVec2( ic_x - 3.f, ic_y ), 1.5f, ic_col, 8 );
-                        dl->AddCircle( ImVec2( ic_x + 3.f, ic_y ), 3.5f + pulse2 * 0.7f, ic_col, 12, 1.6f );
-                        dl->AddCircleFilled( ImVec2( ic_x + 3.f, ic_y ), 1.5f, ic_col, 8 );
-                        break;
-                    }
-                    case 3: {
-                        const float arc_r = 5.5f;
-                        const int segs = 12;
-                        for ( int s = 0; s < segs; ++s ) {
-                            const float a1 = -2.8f + ( 6.3f ) * s / segs;
-                            const float a2 = -2.8f + ( 6.3f ) * ( s + 1 ) / segs;
-                            dl->AddLine(
-                                ImVec2( ic_x + arc_r * std::cos( a1 ), ic_y + arc_r * std::sin( a1 ) ),
-                                ImVec2( ic_x + arc_r * std::cos( a2 ), ic_y + arc_r * std::sin( a2 ) ),
-                                ic_col, 1.8f );
-                        }
-                        const float tip_a = 2.2f;
-                        const float tip_r = 5.5f;
-                        const float tip_x = ic_x + tip_r * std::cos( tip_a );
-                        const float tip_y = ic_y + tip_r * std::sin( tip_a );
-                        dl->AddTriangleFilled(
-                            ImVec2( tip_x + 2.5f, tip_y - 3.f ),
-                            ImVec2( tip_x + 2.5f, tip_y + 1.f ),
-                            ImVec2( tip_x - 1.f, tip_y - 1.f ),
-                            ic_col );
-                        break;
-                    }
-                    case 4: {
-                        const float gr = 6.5f;
-                        for ( int s = 0; s < 8; ++s ) {
-                            const float a1 = 6.2832f / 8.f * s - 1.5708f;
-                            const float a2 = 6.2832f / 8.f * ( s + 1 ) - 1.5708f;
-                            const float inner_r = ( s % 2 == 0 ) ? gr - 1.5f : gr;
-                            dl->AddLine(
-                                ImVec2( ic_x + inner_r * std::cos( a1 ), ic_y + inner_r * std::sin( a1 ) ),
-                                ImVec2( ic_x + gr * std::cos( ( a1 + a2 ) * 0.5f ), ic_y + gr * std::sin( ( a1 + a2 ) * 0.5f ) ),
-                                ic_col, 1.8f );
-                            dl->AddLine(
-                                ImVec2( ic_x + gr * std::cos( ( a1 + a2 ) * 0.5f ), ic_y + gr * std::sin( ( a1 + a2 ) * 0.5f ) ),
-                                ImVec2( ic_x + inner_r * std::cos( a2 ), ic_y + inner_r * std::sin( a2 ) ),
-                                ic_col, 1.8f );
-                        }
-                        dl->AddCircleFilled( ImVec2( ic_x, ic_y ), 2.0f, ic_col, 8 );
-                        break;
-                    }
-                    case 5: {
-                        const float bw = 10.f, bh = 2.f;
-                        dl->AddRectFilled( ImVec2( ic_x - bw * 0.5f, ic_y - 5.f ), ImVec2( ic_x + bw * 0.5f, ic_y - 5.f + bh ), ic_col, 1.f );
-                        dl->AddRectFilled( ImVec2( ic_x - bw * 0.5f, ic_y - 1.f ), ImVec2( ic_x + bw * 0.5f, ic_y - 1.f + bh ), ic_col, 1.f );
-                        dl->AddRectFilled( ImVec2( ic_x - bw * 0.5f, ic_y + 3.f ), ImVec2( ic_x + bw * 0.5f, ic_y + 3.f + bh ), ic_col, 1.f );
-                        dl->AddCircleFilled( ImVec2( ic_x + bw * 0.5f + 1.f, ic_y - 4.f ), 1.2f, ic_col, 6 );
-                        dl->AddCircleFilled( ImVec2( ic_x + bw * 0.5f + 1.f, ic_y + 0.f ), 1.2f, ic_col, 6 );
-                        dl->AddCircleFilled( ImVec2( ic_x + bw * 0.5f + 1.f, ic_y + 4.f ), 1.2f, ic_col, 6 );
-                        break;
-                    }
-                    case 6: {
-                        const float cx = ic_x;
-                        const float cy = ic_y;
-                        dl->AddRectFilled( ImVec2( cx - 5.f, cy - 2.f ), ImVec2( cx + 5.f, cy + 4.f ), ic_col, 1.5f );
-                        dl->AddCircleFilled( ImVec2( cx - 3.f, cy - 1.f ), 3.2f, ic_col, 10 );
-                        dl->AddCircleFilled( ImVec2( cx, cy - 3.f ), 3.8f, ic_col, 10 );
-                        dl->AddCircleFilled( ImVec2( cx + 3.f, cy - 1.f ), 3.2f, ic_col, 10 );
-                        break;
-                    }
+                if ( active ) {
+                    dl->AddCircleFilled( ic, 13.f, theme::fade( theme::accent_alpha( 0.10f ) ), 20 );
+                    dl->AddCircleFilled( ic, 7.f, theme::fade( theme::accent_alpha( 0.08f ) ), 16 );
                 }
+                draw_nav_icon( dl, i, ic, theme::fade( ic_col ) );
 
-                draw_sidebar_icon( dl, i, ImVec2( ic_x, ic_y ), nav_col );
+                if ( module_dot[ i ] )
+                    status_dot( dl, ImVec2( ic.x + 11.f, ic.y - 9.f ), module_on[ i ], 2.f );
 
-                const ImVec2 ts = ImGui::CalcTextSize( tab_names[ i ] );
-                const float label_x = btn_min.x + 30.0f;
-                const float label_y = btn_min.y + ( tab_h - ts.y ) * 0.5f;
-                const ImU32 text_col = active ? theme::text_accent() : ( hov ? theme::text_bright() : theme::text() );
-                (void)label_x; (void)label_y; (void)text_col;
-                if ( hov )
-                    ImGui::SetTooltip( "%s", tab_names[ i ] );
+                ImFont* lf = theme::font_small;
+                const ImVec2 ts = lf->CalcTextSizeA( lf->LegacySize, FLT_MAX, 0.f, tab_names[ i ] );
+                const ImU32 label_col = active ? theme::text_accent() : ( hov ? theme::text() : theme::text_faint() );
+                dl->AddText( lf, lf->LegacySize,
+                    ImVec2( b0.x + ( SB_W - 2.f - ts.x ) * 0.5f + shift, snap_text_y( ty + 33.f ) ),
+                    theme::fade( label_col ), tab_names[ i ] );
             }
         }
 
+        // ------------------------------------------------------------------
+        // rail footer — attach status + credit
+        // ------------------------------------------------------------------
         {
-            const float title_y = wpos.y;
-            const float title_h = TITLE_H;
-            const ImVec2 tp0 = ImVec2( wpos.x + SIDEBAR_W + 1, title_y + 3.f );
-            const ImVec2 tp1 = ImVec2( wpos.x + wsize.x, title_y + title_h );
+            const bool osu_found = input::target_window( ) && IsWindow( input::target_window( ) );
+            dl->AddLine( S( 10.f, H - 52.f ), S( SB_W - 10.f, H - 52.f ), theme::fade( IM_COL32( 32, 31, 39, 255 ) ), 1.f );
 
-            dl->AddRectFilled( tp0, tp1, IM_COL32( 11, 11, 11, 255 ) );
-            dl->AddLine( ImVec2( tp0.x, tp1.y ), tp1, theme::border(), 1.f );
-            static const char* section_names[] = { "AIM ASSIST", "RELAX", "TAP ASSIST", "REPLAY", "AUTOBOT", "SYSTEM", "CONFIG" };
-            dl->AddText( ImVec2( tp0.x + 10.f, tp0.y + 4.f ), theme::text_dim(), section_names[ m_tab ] );
+            ImFont* sf = theme::font_small;
+            const char* att = osu_found ? "attached" : "searching";
+            const ImVec2 ats = sf->CalcTextSizeA( sf->LegacySize, FLT_MAX, 0.f, att );
+            const float ax = wpos.x + ( SB_W - ats.x - 9.f ) * 0.5f;
+            const float ay = wpos.y + H - 42.f;
+            dl->AddCircleFilled( ImVec2( ax + 2.5f, ay + ats.y * 0.5f ),
+                2.5f, theme::fade( osu_found ? theme::good() : theme::text_faint() ), 10 );
+            dl->AddText( sf, sf->LegacySize, ImVec2( ax + 9.f, snap_text_y( ay ) ),
+                theme::fade( osu_found ? theme::text_dim() : theme::text_faint() ), att );
 
-            ImGui::SetCursorPos( ImVec2( SIDEBAR_W + 1, 3.f ) );
-            ImGui::InvisibleButton( "##titlebar", ImVec2( wsize.x - SIDEBAR_W - 35.0f, title_h ) );
+            const char* credit = "based on lame";
+            const ImVec2 cs = sf->CalcTextSizeA( sf->LegacySize, FLT_MAX, 0.f, credit );
+            dl->AddText( sf, sf->LegacySize,
+                ImVec2( wpos.x + ( SB_W - cs.x ) * 0.5f, snap_text_y( wpos.y + H - 24.f ) ),
+                theme::fade( theme::text_faint() ), credit );
+        }
+
+        // ------------------------------------------------------------------
+        // header — page title, subtitle, animated underline, close
+        // ------------------------------------------------------------------
+        static const char* page_titles[ ] = { "Aim Assist", "Relax", "Tap Assist", "Replay", "Autobot", "System", "Config" };
+        static const char* page_subs[ ] = {
+            "cursor correction & adaptive tuning",
+            "automatic tapping & timing shape",
+            "keypress timing correction",
+            "replay playback & parsing",
+            "autonomous gameplay & motion",
+            "bindings, client & diagnostics",
+            "profiles & persistence" };
+
+        {
+            dl->AddRectFilled( S( SB_W + 1.f, 2.f ), S( W, HDR_H ), theme::fade( theme::header_bg() ) );
+            dl->AddLine( S( SB_W + 1.f, HDR_H ), S( W, HDR_H ), theme::fade( theme::border() ), 1.f );
+
+            ImFont* tf = theme::font_bold;
+            ImFont* sf = theme::font_small;
+            const float tx = SB_W + 16.f;
+            dl->AddText( tf, tf->LegacySize, S( tx, 5.f ), theme::fade( theme::text_bright() ), page_titles[ m_tab ] );
+            dl->AddText( sf, sf->LegacySize, S( tx + 1.f, 23.f ), theme::fade( theme::text_dim() ), page_subs[ m_tab ] );
+
+            const float title_w = tf->CalcTextSizeA( tf->LegacySize, FLT_MAX, 0.f, page_titles[ m_tab ] ).x;
+            const float uw = ( title_w + 18.f ) * page_entrance( );
+            dl->AddRectFilled( S( tx, HDR_H - 2.f ), S( tx + uw, HDR_H ), theme::fade( theme::accent() ) );
+
+            const char* build = "lamev2 \xc2\xb7 private";
+            const float build_w = sf->CalcTextSizeA( sf->LegacySize, FLT_MAX, 0.f, build ).x;
+            dl->AddText( sf, sf->LegacySize, S( W - build_w - 42.f, 13.f ), theme::fade( theme::text_faint() ), build );
+
+            // drag region (excludes close button)
+            ImGui::SetCursorPos( ImVec2( SB_W + 1.f, 2.f ) );
+            ImGui::InvisibleButton( "##titlebar", ImVec2( W - SB_W - 44.f, HDR_H - 2.f ) );
             if ( ImGui::IsItemActive( ) ) {
-                m_menu_offset_x += static_cast<int>( ImGui::GetIO( ).MouseDelta.x );
-                m_menu_offset_y += static_cast<int>( ImGui::GetIO( ).MouseDelta.y );
+                m_menu_offset_x += static_cast<int>( io.MouseDelta.x );
+                m_menu_offset_y += static_cast<int>( io.MouseDelta.y );
+            }
+
+            // close button — same close request as the menu key, nothing more
+            ImGui::SetCursorPos( ImVec2( W - 34.f, 6.f ) );
+            ImGui::InvisibleButton( "##close", ImVec2( 26.f, 26.f ) );
+            const bool xhov = ImGui::IsItemHovered( );
+            const float xt = anim( ImGui::GetID( "##close_anim" ), xhov ? 1.f : 0.f, 13.f, 0.f );
+            const ImVec2 xc = S( W - 21.f, 19.f );
+            if ( xt > 0.01f )
+                dl->AddRectFilled( ImVec2( xc.x - 11.f, xc.y - 11.f ), ImVec2( xc.x + 11.f, xc.y + 11.f ),
+                    theme::fade( theme::accent_alpha( 0.14f * xt ) ), 3.f );
+            const ImU32 xcol = theme::fade( theme::lerp_color( theme::text_dim(), theme::text_bright(), xt ) );
+            dl->AddLine( ImVec2( xc.x - 4.f, xc.y - 4.f ), ImVec2( xc.x + 4.f, xc.y + 4.f ), xcol, 1.4f );
+            dl->AddLine( ImVec2( xc.x - 4.f, xc.y + 4.f ), ImVec2( xc.x + 4.f, xc.y - 4.f ), xcol, 1.4f );
+            if ( ImGui::IsItemClicked( ImGuiMouseButton_Left ) ) {
+                m_visible = false;
+                close_transient_ui( );
             }
         }
 
-        {
-            const float CLOSE_W = 20.0f;
-            ImGui::SetCursorPos( ImVec2( wsize.x - CLOSE_W - 6.0f, 3.0f ) );
-            ImGui::PushStyleColor( ImGuiCol_Button, ImVec4( 0, 0, 0, 0 ) );
-            ImGui::PushStyleColor( ImGuiCol_ButtonActive, ImVec4( 0, 0, 0, 0 ) );
-            ImGui::PushStyleColor( ImGuiCol_ButtonHovered, ImVec4( 0, 0, 0, 0 ) );
-            ImGui::PushStyleColor( ImGuiCol_Text, theme::text_dim() );
-            if ( ImGui::Button( "X##close", ImVec2( CLOSE_W, TITLE_H ) ) ) {
-                PostMessageW( m_hwnd, WM_CLOSE, 0, 0 );
-            }
-            ImGui::PopStyleColor( 4 );
-        }
+        // ------------------------------------------------------------------
+        // page content — fades/slides in on tab switch
+        // ------------------------------------------------------------------
+        const float pe = page_entrance( );
+        theme::content_mul = pe;
+        const float slide = ( 1.f - pe ) * 8.f;
 
-        const float entrance = 1.0f;
-        const float content_alpha = entrance;
-        const float content_slide = 0.0f;
-
+        float replay_banner_h = 0.f;
         if ( snap.game.is_replay ) {
-            const float warn_y = wpos.y + TITLE_H + 10.0f;
-            dl->AddRectFilled(
-                ImVec2( wpos.x + SIDEBAR_W + 12.0f, warn_y ),
-                ImVec2( wpos.x + wsize.x - 12.0f, warn_y + 30.0f ),
-                IM_COL32( 96, 24, 24, static_cast<int>( 180 * alpha ) ) );
-            dl->AddText(
-                ImVec2( wpos.x + SIDEBAR_W + 22.0f, warn_y + 7.0f ),
-                IM_COL32( 255, 100, 100, static_cast<int>( 255 * alpha ) ), "RAD" );
+            const float by0 = HDR_H + 10.f;
+            dl->AddRectFilled( S( L_X, by0 ), S( R_X + COL_W, by0 + 28.f ),
+                theme::fade( IM_COL32( 82, 26, 30, 200 ) ), 3.f );
+            dl->AddRect( S( L_X, by0 ), S( R_X + COL_W, by0 + 28.f ),
+                theme::fade( IM_COL32( 150, 60, 60, 160 ) ), 3.f, 0, 1.f );
+            dl->AddText( theme::font_small, theme::font_small->LegacySize, S( L_X + 12.f, by0 + 7.f ),
+                theme::fade( theme::bad() ), "replay detected - input modules paused" );
+            replay_banner_h = 36.f;
         }
 
-        const float replay_banner_h = snap.game.is_replay ? 36.0f : 0.0f;
+        const float top0 = HDR_H + 12.f + slide + replay_banner_h;
 
-        if ( m_tab == 0 ) {
-            float lbox_top = TITLE_H + 14.0f + content_slide + replay_banner_h;
-            float ly = lbox_top + 30.0f;
-            dl->ChannelsSplit(2);
-            dl->ChannelsSetCurrent(1);
-            ImGui::SetCursorPos(ImVec2(L_X + 12.0f, ly));
-            checkbox("Enable aim assist", &m_aim.enabled);
-            ly = ImGui::GetCursorPos().y + 4.0f;
-            ImGui::SetCursorPos(ImVec2(L_X + 12.0f, ly));
-            checkbox("Ignore sliders", &m_aim.ignore_sliders);
-            ly = ImGui::GetCursorPos().y + 4.0f;
-            ImGui::SetCursorPos(ImVec2(L_X + 12.0f, ly));
-            checkbox("Tablet mode", &m_aim.tablet_mode);
-            ly = ImGui::GetCursorPos().y + 8.0f;
+        // window-relative content helpers
+        auto sect = [&]( float x, float& lyy, const char* t ) {
+            float sy = wpos.y + lyy;
+            section_label( dl, wpos.x + x, sy, t );
+            lyy = sy - wpos.y;
+        };
+        auto kv = [&]( float x, float& lyy, float w, const char* label, const char* val, ImU32 c = 0 ) {
+            float sy = wpos.y + lyy;
+            kv_row( dl, wpos.x + x, sy, w, label, val, c );
+            lyy = sy - wpos.y;
+        };
+        auto fold = [&]( float x, float& lyy, float w, const char* label, bool def_open = false ) {
+            float sy = wpos.y + lyy;
+            const bool open = collapsible( dl, wpos.x + x, sy, w, label, def_open );
+            lyy = sy - wpos.y;
+            return open;
+        };
+
+        // ==================================================================
+        if ( m_tab == 0 ) {  // AIM ASSIST
+            float ly = top0 + 36.f;
+            dl->ChannelsSplit( 2 );
+            dl->ChannelsSetCurrent( 1 );
+
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Enable aim assist", &m_aim.enabled, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Ignore sliders", &m_aim.ignore_sliders, nullptr, nullptr, CW );
+            tip( "Skip correction while a slider is being followed." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Tablet mode", &m_aim.tablet_mode, nullptr, nullptr, CW );
+            tip( "Adjusts correction for absolute (tablet) input." );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
+
+            sect( L_X + 14.f, ly, "CORRECTION" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Assist Strength", &m_aim.assist_strength, 5.0f, 100.0f, " %", "%.0f", CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Assist Radius", &m_aim.assist_radius, 1.1f, 4.0f, " x radius", "%.2f", CW );
+            tip( "How far around a hit circle the assist engages." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Smoothing", &m_aim.smoothing_ms, 35.f, 180.f, " ms", "%.0f", CW );
+            tip( "Higher = softer, more human-looking correction." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Maximum Correction", &m_aim.max_correction, 0.10f, 1.75f, " x radius", "%.2f", CW );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
+
+            sect( L_X + 14.f, ly, "ADAPTIVE" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Adaptive Aim", &m_aim.adaptive_aim, nullptr, nullptr, CW );
+            tip( "Scales strength & smoothing with live map difficulty." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            if ( m_aim.adaptive_aim ) {
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                slider_float( "Adaptation Strength", &m_aim.adaptation_strength, 0.f, 100.f, " %", "%.0f", CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
+            }
+
+            const float lbot = ly + 12.f;
+            dl->ChannelsSetCurrent( 0 );
+            draw_panel( dl, S( L_X, top0 ), S( L_X + COL_W, lbot ), "AIM ASSIST" );
+            dl->ChannelsMerge( );
+
+            // ---------- right: diagnostics ----------
+            float ry = top0 + 36.f;
+            dl->ChannelsSplit( 2 );
+            dl->ChannelsSetCurrent( 1 );
 
             const aim_assist::aim_verification_t verify = m_aim.verification( );
             const double report_count = static_cast<double>( verify.aim_reports );
+            const double target_count = static_cast<double>( verify.target_bearing_reports );
             const double relevant_count = static_cast<double>( verify.relevant_approach_reports );
+            const double target_percent = report_count > 0.0 ? target_count * 100.0 / report_count : 0.0;
+            const double relevant_percent = target_count > 0.0 ? relevant_count * 100.0 / target_count : 0.0;
             const double engaged_percent = relevant_count > 0.0
                 ? static_cast<double>( verify.engaged_reports ) * 100.0 / relevant_count : 0.0;
+            const double corrected_percent = target_count > 0.0
+                ? static_cast<double>( verify.corrected_reports ) * 100.0 / target_count : 0.0;
             const double non_zero_percent = report_count > 0.0
                 ? static_cast<double>( verify.non_zero_corrections ) * 100.0 / report_count : 0.0;
             const double average_requested_correction = verify.requested_non_zero_samples > 0
                 ? verify.requested_correction_sum / static_cast<double>( verify.requested_non_zero_samples ) : 0.0;
             const double average_relevant_predicted_miss = verify.relevant_predicted_miss_samples > 0
-                ? verify.relevant_predicted_miss_sum /
-                    static_cast<double>( verify.relevant_predicted_miss_samples ) : 0.0;
+                ? verify.relevant_predicted_miss_sum / static_cast<double>( verify.relevant_predicted_miss_samples ) : 0.0;
             const double average_corrected_predicted_miss = verify.corrected_predicted_miss_samples > 0
-                ? verify.corrected_predicted_miss_sum /
-                    static_cast<double>( verify.corrected_predicted_miss_samples ) : 0.0;
+                ? verify.corrected_predicted_miss_sum / static_cast<double>( verify.corrected_predicted_miss_samples ) : 0.0;
             const double average_corrected_observed = verify.corrected_observed_samples > 0
-                ? verify.corrected_observed_sum /
-                    static_cast<double>( verify.corrected_observed_samples ) : 0.0;
+                ? verify.corrected_observed_sum / static_cast<double>( verify.corrected_observed_samples ) : 0.0;
             const double observed_requested_ratio = verify.requested_correction_sum > 0.0
                 ? verify.corrected_observed_sum * 100.0 / verify.requested_correction_sum : 0.0;
-
-            auto verification_line = [&]( const char* text ) {
-                dl->AddText( S( L_X + 14.0f, ly ), theme::text_dim( ), text );
-                ly += ImGui::GetTextLineHeight( ) + 2.0f;
-            };
-
-            char verify_buf[ 128 ]{};
-            sprintf_s( verify_buf, "Aim reports: %llu",
-                static_cast<unsigned long long>( verify.aim_reports ) );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Relevant approach reports: %llu",
-                static_cast<unsigned long long>( verify.relevant_approach_reports ) );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Engaged: %llu (%.1f%%)",
-                static_cast<unsigned long long>( verify.engaged_reports ), engaged_percent );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Non-zero corrections: %llu (%.1f%%)",
-                static_cast<unsigned long long>( verify.non_zero_corrections ), non_zero_percent );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Average requested correction: %.2f px",
-                average_requested_correction );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Peak requested correction: %.2f px", verify.peak_requested_correction );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Average observed correction: %.2f px",
-                average_corrected_observed );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Observed/requested while corrected: %.1f%%",
-                observed_requested_ratio );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Peak observed output delta: %.2f px", verify.peak_observed_output_delta );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Adaptive difficulty: %.2f", verify.adaptive_difficulty );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Effective strength: %.0f%%", verify.effective_strength );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Effective smoothing: %.0f ms", verify.effective_smoothing_ms );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Effective maximum correction: %.2fx", verify.effective_max_correction );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Safe destination: %.2fx hit radius",
-                verify.safe_destination_multiplier );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Average predicted miss (relevant): %.2f px",
-                average_relevant_predicted_miss );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Average predicted miss (corrected): %.2f px",
-                average_corrected_predicted_miss );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Peak predicted miss (corrected): %.2f px",
-                verify.peak_corrected_predicted_miss );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Rejected safe trajectory: %llu",
-                static_cast<unsigned long long>( verify.rejected_safe_trajectory ) );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Rejected distance: %llu",
-                static_cast<unsigned long long>( verify.rejected_distance ) );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Rejected direction: %llu",
-                static_cast<unsigned long long>( verify.rejected_direction ) );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Rejected timing: %llu",
-                static_cast<unsigned long long>( verify.rejected_timing ) );
-            verification_line( verify_buf );
-            sprintf_s( verify_buf, "Corrected: %llu",
-                static_cast<unsigned long long>( verify.corrected_reports ) );
-            verification_line( verify_buf );
-
-            const float lbox_bottom = ly + 12.0f;
-            dl->ChannelsSetCurrent(0);
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "aim assist" );
-            dl->ChannelsMerge();
-
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
-            dl->ChannelsSplit(2);
-            dl->ChannelsSetCurrent(1);
-            ImGui::SetCursorPos(ImVec2(R_X + 12.0f, ry));
-            slider_float("Assist Strength", &m_aim.assist_strength, 5.0f, 100.0f, " %", "%.0f");
-            ry = ImGui::GetCursorPos().y + 3.0f;
-            ImGui::SetCursorPos(ImVec2(R_X + 12.0f, ry));
-            slider_float("Assist Radius", &m_aim.assist_radius, 1.1f, 4.0f, " x hit radius", "%.2f");
-            ry = ImGui::GetCursorPos().y + 3.0f;
-            ImGui::SetCursorPos(ImVec2(R_X + 12.0f, ry));
-            slider_float("Smoothing", &m_aim.smoothing_ms, 35.f, 180.f, " ms", "%.0f");
-            ry = ImGui::GetCursorPos().y + 3.0f;
-            ImGui::SetCursorPos(ImVec2(R_X + 12.0f, ry));
-            slider_float("Maximum Correction", &m_aim.max_correction, 0.10f, 1.25f, " x hit radius", "%.2f");
-            ry = ImGui::GetCursorPos().y + 3.0f;
-            ImGui::SetCursorPos(ImVec2(R_X + 12.0f, ry));
-            checkbox("Adaptive Aim", &m_aim.adaptive_aim);
-            ry = ImGui::GetCursorPos().y + 3.0f;
-            if ( m_aim.adaptive_aim ) {
-                ImGui::SetCursorPos(ImVec2(R_X + 12.0f, ry));
-                slider_float("Adaptation Strength", &m_aim.adaptation_strength,
-                    0.f, 100.f, " %", "%.0f");
-                ry = ImGui::GetCursorPos().y + 3.0f;
+            const double average_low_medium_correction = verify.low_medium_correction_samples > 0
+                ? verify.low_medium_correction_sum / static_cast<double>( verify.low_medium_correction_samples ) : 0.0;
+            const double average_high_extreme_correction = verify.high_extreme_correction_samples > 0
+                ? verify.high_extreme_correction_sum / static_cast<double>( verify.high_extreme_correction_samples ) : 0.0;
+            const double average_first_rescue_miss = verify.first_rescue_miss_samples > 0
+                ? verify.first_rescue_miss_sum / static_cast<double>( verify.first_rescue_miss_samples ) : 0.0;
+            const double average_final_correction_miss = verify.final_correction_miss_samples > 0
+                ? verify.final_correction_miss_sum / static_cast<double>( verify.final_correction_miss_samples ) : 0.0;
+            const double adaptive_seconds = verify.adaptive_sample_seconds;
+            const double average_adaptive_difficulty = adaptive_seconds > 0.0
+                ? verify.adaptive_difficulty_time_sum / adaptive_seconds : 0.0;
+            const double average_effective_strength = adaptive_seconds > 0.0
+                ? verify.effective_strength_time_sum / adaptive_seconds : 0.0;
+            const double average_effective_smoothing = adaptive_seconds > 0.0
+                ? verify.effective_smoothing_time_sum / adaptive_seconds : 0.0;
+            const double average_effective_max_correction = adaptive_seconds > 0.0
+                ? verify.effective_max_correction_time_sum / adaptive_seconds : 0.0;
+            double difficulty_bucket_percent[ 4 ]{};
+            if ( adaptive_seconds > 0.0 ) {
+                for ( size_t bi = 0; bi < 4; ++bi )
+                    difficulty_bucket_percent[ bi ] = verify.difficulty_bucket_seconds[ bi ] * 100.0 / adaptive_seconds;
             }
-            const float rbox_bottom = ry + 12.0f;
-            dl->ChannelsSetCurrent(0);
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "aim assist tune" );
-            dl->ChannelsMerge();
-        }
-        else         if ( m_tab == 1 ) {
-            const float lbox_top = TITLE_H + 14.0f + content_slide + replay_banner_h;
-            float ly = lbox_top + 30.0f;
 
+            char vb[ 128 ]{};
+            const ImU32 zero_dim = theme::text_faint();
+
+            sect( R_X + 14.f, ry, "SESSION" );
+            sprintf_s( vb, "%llu", static_cast<unsigned long long>( verify.aim_reports ) );
+            kv( R_X + 14.f, ry, CW, "Input reports", vb, verify.aim_reports ? 0 : zero_dim );
+            sprintf_s( vb, "%llu  (%.1f%%)", static_cast<unsigned long long>( verify.corrected_reports ), corrected_percent );
+            kv( R_X + 14.f, ry, CW, "Corrected", vb, verify.corrected_reports ? 0 : zero_dim );
+            sprintf_s( vb, "%llu  (%.1f%%)", static_cast<unsigned long long>( verify.non_zero_corrections ), non_zero_percent );
+            kv( R_X + 14.f, ry, CW, "Non-zero output", vb, verify.non_zero_corrections ? 0 : zero_dim );
+            sprintf_s( vb, "%.2f / %.2f px", average_requested_correction, average_corrected_observed );
+            kv( R_X + 14.f, ry, CW, "Avg requested / observed", vb );
+            sprintf_s( vb, "%.1f%%", observed_requested_ratio );
+            kv( R_X + 14.f, ry, CW, "Observed / requested", vb );
+            ry += 4.f;
+
+            if ( fold( R_X + 14.f, ry, CW, "DETAILED TELEMETRY" ) ) {
+                sprintf_s( vb, "%llu  (%.1f%%)", static_cast<unsigned long long>( verify.target_bearing_reports ), target_percent );
+                kv( R_X + 14.f, ry, CW, "Target-bearing", vb );
+                sprintf_s( vb, "%llu  (%.1f%%)", static_cast<unsigned long long>( verify.relevant_approach_reports ), relevant_percent );
+                kv( R_X + 14.f, ry, CW, "Relevant", vb );
+                sprintf_s( vb, "%llu  (%.1f%%)", static_cast<unsigned long long>( verify.engaged_reports ), engaged_percent );
+                kv( R_X + 14.f, ry, CW, "Engaged", vb );
+                sprintf_s( vb, "%.2f / %.2f px", verify.peak_requested_correction, verify.peak_observed_output_delta );
+                kv( R_X + 14.f, ry, CW, "Peak requested / observed", vb );
+                sprintf_s( vb, "%llu", static_cast<unsigned long long>( verify.max_correction_clamp_hits ) );
+                kv( R_X + 14.f, ry, CW, "Max-correction clamps", vb, verify.max_correction_clamp_hits ? theme::warn() : zero_dim );
+                sprintf_s( vb, "%llu / %llu",
+                    static_cast<unsigned long long>( verify.rejected_safe_trajectory ),
+                    static_cast<unsigned long long>( verify.rejected_distance ) );
+                kv( R_X + 14.f, ry, CW, "Reject safe / distance", vb );
+                sprintf_s( vb, "%llu / %llu",
+                    static_cast<unsigned long long>( verify.rejected_direction ),
+                    static_cast<unsigned long long>( verify.rejected_timing ) );
+                kv( R_X + 14.f, ry, CW, "Reject direction / timing", vb );
+                sprintf_s( vb, "%.1f / %.1f px", average_relevant_predicted_miss, average_corrected_predicted_miss );
+                kv( R_X + 14.f, ry, CW, "Pred. miss rel / corr", vb );
+                sprintf_s( vb, "%.1f px", verify.peak_corrected_predicted_miss );
+                kv( R_X + 14.f, ry, CW, "Pred. miss peak", vb );
+                sprintf_s( vb, "%.2f", verify.adaptive_difficulty );
+                kv( R_X + 14.f, ry, CW, "Difficulty now", vb );
+                sprintf_s( vb, "%.0f%% / %.0fms / %.2fx",
+                    verify.effective_strength, verify.effective_smoothing_ms, verify.effective_max_correction );
+                kv( R_X + 14.f, ry, CW, "Now S / Sm / Max", vb );
+                sprintf_s( vb, "%.2f / %.2f", average_adaptive_difficulty, verify.adaptive_difficulty_peak );
+                kv( R_X + 14.f, ry, CW, "Difficulty avg / peak", vb );
+                sprintf_s( vb, "%.0f%% / %.0f%%", difficulty_bucket_percent[ 0 ], difficulty_bucket_percent[ 1 ] );
+                kv( R_X + 14.f, ry, CW, "Time low / medium", vb );
+                sprintf_s( vb, "%.0f%% / %.0f%%", difficulty_bucket_percent[ 2 ], difficulty_bucket_percent[ 3 ] );
+                kv( R_X + 14.f, ry, CW, "Time high / extreme", vb );
+                sprintf_s( vb, "%.0f / %.0f / %.0f%%",
+                    verify.effective_strength_min, average_effective_strength, verify.effective_strength_max );
+                kv( R_X + 14.f, ry, CW, "Strength min/avg/max", vb );
+                sprintf_s( vb, "%.0f / %.0f / %.0f ms",
+                    verify.effective_smoothing_min, average_effective_smoothing, verify.effective_smoothing_max );
+                kv( R_X + 14.f, ry, CW, "Smoothing min/avg/max", vb );
+                sprintf_s( vb, "%.2f / %.2f / %.2fx",
+                    verify.effective_max_correction_min, average_effective_max_correction, verify.effective_max_correction_max );
+                kv( R_X + 14.f, ry, CW, "Max corr min/avg/max", vb );
+                sprintf_s( vb, "%.0f / %.0f ms", verify.effective_anticipation_min, verify.effective_anticipation_max );
+                kv( R_X + 14.f, ry, CW, "Anticipation min / max", vb );
+                sprintf_s( vb, "%llu", static_cast<unsigned long long>( verify.adaptive_hard_pattern_activations ) );
+                kv( R_X + 14.f, ry, CW, "Hard-pattern activations", vb, verify.adaptive_hard_pattern_activations ? 0 : zero_dim );
+                sprintf_s( vb, "%llu/%llu/%llu/%llu",
+                    static_cast<unsigned long long>( verify.corrected_by_difficulty[ 0 ] ),
+                    static_cast<unsigned long long>( verify.corrected_by_difficulty[ 1 ] ),
+                    static_cast<unsigned long long>( verify.corrected_by_difficulty[ 2 ] ),
+                    static_cast<unsigned long long>( verify.corrected_by_difficulty[ 3 ] ) );
+                kv( R_X + 14.f, ry, CW, "Corrected L/M/H/X", vb );
+                sprintf_s( vb, "%llu / %llu",
+                    static_cast<unsigned long long>( verify.high_difficulty_rescue_activations ),
+                    static_cast<unsigned long long>( verify.large_jump_rescue_activations ) );
+                kv( R_X + 14.f, ry, CW, "Rescues high / large", vb );
+                sprintf_s( vb, "%.2f / %.2f px", average_low_medium_correction, average_high_extreme_correction );
+                kv( R_X + 14.f, ry, CW, "Avg corr L-M / H-X", vb );
+                sprintf_s( vb, "%.1f / %.1f px", average_first_rescue_miss, average_final_correction_miss );
+                kv( R_X + 14.f, ry, CW, "Miss rescue / final", vb );
+            }
+
+            const float rbot = ry + 12.f;
+            dl->ChannelsSetCurrent( 0 );
+            draw_panel( dl, S( R_X, top0 ), S( R_X + COL_W, rbot ), "DIAGNOSTICS" );
+            dl->ChannelsMerge( );
+        }
+        // ==================================================================
+        else if ( m_tab == 1 ) {  // RELAX
+            float ly = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Enable relax", &m_relax.enabled );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Enable relax", &m_relax.enabled, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_int( "Base Offset", &m_relax.manual_offset_ms, -100, 100, " ms" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            sect( L_X + 14.f, ly, "GENERAL TIMING" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_int( "Base Offset", &m_relax.manual_offset_ms, -100, 100, " ms", CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Timing Consistency", &m_relax.ur, 0.0f, 300.0f, " UR", "%.0f", CW );
+            tip( "Unstable-rate target. Lower = more consistent taps." );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Timing Consistency", &m_relax.ur, 0.0f, 300.0f, " UR", "%.0f" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
-
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Timing Variation", &m_relax.timing_variation );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
-
+            sect( L_X + 14.f, ly, "VARIATION" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Timing Variation", &m_relax.timing_variation, nullptr, nullptr, CW );
+            tip( "Adds slow human-like drift to tap timing." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
             if ( m_relax.timing_variation ) {
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                slider_int( "Early Variation", &m_relax.early_variation_ms, -25, 0, " ms" );
-                ly = ImGui::GetCursorPos( ).y + 3.0f;
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                slider_int( "Early Variation", &m_relax.early_variation_ms, -25, 0, " ms", CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                slider_int( "Late Variation", &m_relax.late_variation_ms, 0, 25, " ms", CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                slider_int( "Timing Drift", &m_relax.timing_drift_ms, 0, 8, " ms", CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
 
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                slider_int( "Late Variation", &m_relax.late_variation_ms, 0, 25, " ms" );
-                ly = ImGui::GetCursorPos( ).y + 3.0f;
-
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                slider_int( "Timing Drift", &m_relax.timing_drift_ms, 0, 8, " ms" );
-                ly = ImGui::GetCursorPos( ).y + 3.0f;
-
-                const int effective_early = m_relax.manual_offset_ms + m_relax.early_variation_ms;
-                const int effective_late = m_relax.manual_offset_ms + m_relax.late_variation_ms;
                 char effective_range[ 64 ]{};
-                sprintf_s( effective_range, "Effective range: %+d ms to %+d ms", effective_early, effective_late );
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                dl->AddText( ImGui::GetCursorScreenPos( ), theme::text_dim(), effective_range );
-                ly += ImGui::GetTextLineHeight( ) + 6.0f;
+                sprintf_s( effective_range, "effective range  %+d ms  to  %+d ms",
+                    m_relax.manual_offset_ms + m_relax.early_variation_ms,
+                    m_relax.manual_offset_ms + m_relax.late_variation_ms );
+                dl->AddText( theme::font_small, theme::font_small->LegacySize, S( L_X + 14.f, ly ),
+                    theme::fade( theme::text_dim() ), effective_range );
+                ly += theme::font_small->LegacySize + 8.f;
+            }
+            else {
+                ly += 4.f;
             }
 
+            sect( L_X + 14.f, ly, "ADVANCED SINGLETAP" );
             { bool is_singletap = ( m_relax.tap_style == 1 );
-              ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-              checkbox( "Singletap Mode", &is_singletap );
+              ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+              checkbox( "Singletap Mode", &is_singletap, nullptr, nullptr, CW );
               m_relax.tap_style = is_singletap ? 1 : 0; }
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            ly = ImGui::GetCursorPos( ).y + 2.f;
 
             if ( m_relax.tap_style == 1 ) {
-                static const char* primary_keys[] = { "K1", "K2" };
-                static const char* burst_levels[] = { "Low", "Medium", "High" };
+                static const char* primary_keys[ ] = { "K1", "K2" };
+                static const char* burst_levels[ ] = { "Low", "Medium", "High" };
 
-                dl->AddText( S( L_X + 12.0f, ly ), theme::text(), "Primary Key" );
-                ly += ImGui::GetTextLineHeight( ) + 3.0f;
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                dropdown( "##relax_primary_key", &m_relax.primary_key, primary_keys, 2 );
-                ly = ImGui::GetCursorPos( ).y + 4.0f;
+                dl->AddText( S( L_X + 14.f, ly ), theme::fade( theme::text() ), "Primary Key" );
+                ly += ImGui::GetTextLineHeight( ) + 4.f;
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                dropdown( "##relax_primary_key", &m_relax.primary_key, primary_keys, 2, CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
 
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                slider_int( "Singletap Speed", &m_relax.singletap_speed_bpm, 100, 400, " bpm" );
-                ly = ImGui::GetCursorPos( ).y + 4.0f;
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                slider_int( "Singletap Speed", &m_relax.singletap_speed_bpm, 100, 400, " bpm", CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
 
-                dl->AddText( S( L_X + 12.0f, ly ), theme::text(), "Burst Tolerance" );
-                ly += ImGui::GetTextLineHeight( ) + 3.0f;
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                dropdown( "##relax_burst_tolerance", &m_relax.burst_tolerance, burst_levels, 3 );
-                ly = ImGui::GetCursorPos( ).y + 4.0f;
+                dl->AddText( S( L_X + 14.f, ly ), theme::fade( theme::text() ), "Burst Tolerance" );
+                ly += ImGui::GetTextLineHeight( ) + 4.f;
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                dropdown( "##relax_burst_tolerance", &m_relax.burst_tolerance, burst_levels, 3, CW );
+                ly = ImGui::GetCursorPos( ).y + 2.f;
 
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                slider_float( "Stamina", &m_relax.stamina, 0.0f, 100.0f, " %", "%.0f" );
+                ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+                slider_float( "Stamina", &m_relax.stamina, 0.0f, 100.0f, " %", "%.0f", CW );
+                tip( "Simulates fatigue: long streams gradually loosen timing." );
                 ly = ImGui::GetCursorPos( ).y;
             }
 
-            const float lbox_bottom = ly + 12.0f;
+            const float lbot = ly + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "relax options" );
+            draw_panel( dl, S( L_X, top0 ), S( L_X + COL_W, lbot ), "RELAX" );
             dl->ChannelsMerge( );
 
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
-
+            // ---------- right: hold behavior + status ----------
+            float ry = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_bright(), "K1 Hold Shape" );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
+            sect( R_X + 14.f, ry, "K1 HOLD SHAPE" );
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_float( "K1 Center", &m_relax.k1_hold_center, 30.f, 120.f, " ms", "%.0f", CW );
+            ry = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_float( "K1 Spread", &m_relax.k1_hold_spread, 2.f, 30.f, " ms", "%.0f", CW );
+            ry = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_float( "K1 Center", &m_relax.k1_hold_center, 30.f, 120.f, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 3.0f;
+            sect( R_X + 14.f, ry, "K2 HOLD SHAPE" );
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_float( "K2 Center", &m_relax.k2_hold_center, 30.f, 120.f, " ms", "%.0f", CW );
+            ry = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_float( "K2 Spread", &m_relax.k2_hold_spread, 2.f, 30.f, " ms", "%.0f", CW );
+            ry = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_float( "K1 Spread", &m_relax.k1_hold_spread, 2.f, 30.f, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 8.0f;
+            sect( R_X + 14.f, ry, "LIMITS" );
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_float( "Hold floor", &m_relax.hold_floor, 10.f, 60.f, " ms", "%.0f", CW );
+            ry = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_float( "Hold ceiling", &m_relax.hold_ceiling, 60.f, 150.f, " ms", "%.0f", CW );
+            ry = ImGui::GetCursorPos( ).y + 8.f;
 
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_bright(), "K2 Hold Shape" );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_float( "K2 Center", &m_relax.k2_hold_center, 30.f, 120.f, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 3.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_float( "K2 Spread", &m_relax.k2_hold_spread, 2.f, 30.f, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 8.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_float( "Hold floor", &m_relax.hold_floor, 10.f, 60.f, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 3.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_float( "Hold ceiling", &m_relax.hold_ceiling, 60.f, 150.f, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 8.0f;
-
+            sect( R_X + 14.f, ry, "STATUS" );
             if ( m_relax.is_active( ) )
-                dl->AddText( S( R_X + 14.0f, ry ), IM_COL32( 100, 230, 160, 255 ), "Status: Running" );
+                kv( R_X + 14.f, ry, CW, "State", "running", theme::good() );
             else if ( m_relax.is_synced( ) && m_relax.enabled )
-                dl->AddText( S( R_X + 14.0f, ry ), IM_COL32( 230, 200, 100, 255 ), "Status: Synced" );
+                kv( R_X + 14.f, ry, CW, "State", "synced", theme::warn() );
             else
-                dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "Status: Idle" );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
+                kv( R_X + 14.f, ry, CW, "State", "idle", theme::text_faint() );
 
             if ( m_relax.enabled ) {
                 char buf[ 96 ];
-                sprintf_s( buf, "Beatmap: %s | objects: %zu | queue: %zu",
-                    snap.beatmap.loaded ? "loaded" : "NOT LOADED",
-                    snap.beatmap.objects.size( ), m_relax.queue_size( ) );
-                dl->AddText( S( R_X + 14.0f, ry ), snap.beatmap.loaded ? theme::text() : IM_COL32( 255, 150, 120, 255 ), buf );
-                ry += ImGui::GetTextLineHeight( ) + 2.0f;
-
+                sprintf_s( buf, "%s", snap.beatmap.loaded ? "loaded" : "not loaded" );
+                kv( R_X + 14.f, ry, CW, "Beatmap", buf, snap.beatmap.loaded ? 0 : theme::bad() );
+                sprintf_s( buf, "%zu / %zu", snap.beatmap.objects.size( ), m_relax.queue_size( ) );
+                kv( R_X + 14.f, ry, CW, "Objects / queue", buf );
                 if ( snap.beatmap.loaded ) {
-                    sprintf_s( buf, "Hit object: %d / %zu", m_relax.last_hit_obj_idx( ), snap.beatmap.objects.size( ) );
-                    dl->AddText( S( R_X + 14.0f, ry ), theme::text(), buf );
-                    ry += ImGui::GetTextLineHeight( );
+                    sprintf_s( buf, "%d / %zu", m_relax.last_hit_obj_idx( ), snap.beatmap.objects.size( ) );
+                    kv( R_X + 14.f, ry, CW, "Hit object", buf );
                 }
             }
 
-            const float rbox_bottom = ry + 12.0f;
+            const float rbot = ry + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "hold times & status" );
+            draw_panel( dl, S( R_X, top0 ), S( R_X + COL_W, rbot ), "HOLD BEHAVIOR" );
             dl->ChannelsMerge( );
         }
-        else if ( m_tab == 2 ) {
-            const float lbox_top = TITLE_H + 14.0f + content_slide + replay_banner_h;
-            float ly = lbox_top + 30.0f;
-
+        // ==================================================================
+        else if ( m_tab == 2 ) {  // TAP ASSIST
+            float ly = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Enable tap assist", &m_tap_assist.enabled );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
-
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Ignore sliders", &m_tap_assist.ignore_sliders );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Enable tap assist", &m_tap_assist.enabled, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Ignore sliders", &m_tap_assist.ignore_sliders, nullptr, nullptr, CW );
             ly = ImGui::GetCursorPos( ).y;
 
-            const float lbox_bottom = ly + 12.0f;
+            const float lbot = ly + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "tap assist" );
+            draw_panel( dl, S( L_X, top0 ), S( L_X + COL_W, lbot ), "TAP ASSIST" );
             dl->ChannelsMerge( );
 
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
-
+            float ry = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_int( "Assist Window", &m_tap_assist.assist_window, 0, 250, " ms" );
-            ry = ImGui::GetCursorPos( ).y + 3.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            slider_int( "Randomization", &m_tap_assist.randomization, 0, 40, " ms" );
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_int( "Assist Window", &m_tap_assist.assist_window, 0, 250, " ms", CW );
+            tip( "How far off a keypress can be and still get corrected." );
+            ry = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            slider_int( "Randomization", &m_tap_assist.randomization, 0, 40, " ms", CW );
+            tip( "Random jitter added to corrected presses." );
             ry = ImGui::GetCursorPos( ).y;
 
-            const float rbox_bottom = ry + 12.0f;
+            const float rbot = ry + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "tap assist tune" );
+            draw_panel( dl, S( R_X, top0 ), S( R_X + COL_W, rbot ), "TUNING" );
             dl->ChannelsMerge( );
         }
-        else if ( m_tab == 3 ) {
-            const float lbox_top = TITLE_H + 14.0f + content_slide + replay_banner_h;
-            float ly = lbox_top + 30.0f;
-
+        // ==================================================================
+        else if ( m_tab == 3 ) {  // REPLAY
+            float ly = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Enable replay bot", &m_replay.enabled );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Enable replay bot", &m_replay.enabled, nullptr, nullptr, CW );
             if ( ImGui::IsItemClicked( ) && m_replay.enabled ) m_replay.reset_sync( );
-            ly = ImGui::GetCursorPos( ).y + 6.0f;
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            dl->AddText( S( L_X + 14.0f, ly ), theme::text_dim(), "Replay path:" );
-            ly += ImGui::GetTextLineHeight( ) + 4.0f;
+            sect( L_X + 14.f, ly, "REPLAY FILE" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            text_input( "##replay_path", m_replay_path_utf8, IM_ARRAYSIZE( m_replay_path_utf8 ), CW );
+            ly = ImGui::GetCursorPos( ).y + 6.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            text_input( "##replay_path", m_replay_path_utf8, IM_ARRAYSIZE( m_replay_path_utf8 ), L_W - 24.0f );
-            ly = ImGui::GetCursorPos( ).y + 6.0f;
-
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            if ( button( "Browse", L_W - 24.0f, 24.0f ) ) {
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            if ( button( "Browse", CW, 24.0f ) ) {
                 OPENFILENAMEW ofn{};
                 wchar_t file[ 512 ]{};
                 ofn.lStructSize = sizeof( ofn );
@@ -1371,123 +1554,272 @@ namespace ui {
                     m_replay.reset_sync( );
                 }
             }
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            ly = ImGui::GetCursorPos( ).y + 4.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            if ( button( "Load Replay", L_W - 24.0f, 24.0f ) ) {
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            if ( button( "Load Replay", CW, 24.0f ) ) {
                 wchar_t wide[ 512 ]{};
                 MultiByteToWideChar( CP_UTF8, 0, m_replay_path_utf8, -1, wide, 512 );
                 m_replay.replay_path = wide;
                 m_replay.load_replay( );
                 m_replay.reset_sync( );
             }
-            ly = ImGui::GetCursorPos( ).y;
+            ly = ImGui::GetCursorPos( ).y + 0.f;
 
-            const float lbox_bottom = ly + 12.0f;
+            const float lbot = ly + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "replay loading" );
+            draw_panel( dl, S( L_X, top0 ), S( L_X + COL_W, lbot ), "REPLAY" );
             dl->ChannelsMerge( );
 
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
-
+            float ry = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            checkbox( "Parse buttons", &m_replay.parse_buttons );
-            ry = ImGui::GetCursorPos( ).y + 8.0f;
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            checkbox( "Parse buttons", &m_replay.parse_buttons, nullptr, nullptr, CW );
+            tip( "Replay key presses too, not just cursor movement." );
+            ry = ImGui::GetCursorPos( ).y + 8.f;
 
-            char buf[ 64 ];
-            sprintf_s( buf, "Frames: %zu", m_replay.frame_count( ) );
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text(), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
-            sprintf_s( buf, "Valid: %s", m_replay.replay_valid( ) ? "yes" : "no" );
-            dl->AddText( S( R_X + 14.0f, ry ), m_replay.replay_valid( ) ? IM_COL32( 100, 230, 160, 255 ) : IM_COL32( 255, 130, 130, 255 ), buf );
-            ry += ImGui::GetTextLineHeight( );
+            sect( R_X + 14.f, ry, "STATUS" );
+            char buf[ 96 ];
+            sprintf_s( buf, "%zu", m_replay.frame_count( ) );
+            kv( R_X + 14.f, ry, CW, "Frames", buf, m_replay.frame_count( ) ? 0 : theme::text_faint() );
+            kv( R_X + 14.f, ry, CW, "Valid", m_replay.replay_valid( ) ? "yes" : "no",
+                m_replay.replay_valid( ) ? theme::good() : theme::bad() );
 
             if ( !m_replay.last_load_error( ).empty( ) ) {
-                ry += 4.0f;
-                dl->AddText( S( R_X + 14.0f, ry ), IM_COL32( 255, 130, 130, 255 ), m_replay.last_load_error( ).c_str( ) );
-                ry += ImGui::GetTextLineHeight( );
+                ry += 4.f;
+                dl->AddText( theme::font_small, theme::font_small->LegacySize, S( R_X + 14.f, ry ),
+                    theme::fade( theme::bad() ), m_replay.last_load_error( ).c_str( ) );
+                ry += theme::font_small->LegacySize + 4.f;
             }
 
-            const float rbox_bottom = ry + 12.0f;
+            const float rbot = ry + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "replay options" );
+            draw_panel( dl, S( R_X, top0 ), S( R_X + COL_W, rbot ), "PLAYBACK" );
             dl->ChannelsMerge( );
         }
-        else if ( m_tab == 4 ) {
-            const float lbox_top = TITLE_H + 14.0f + content_slide + replay_banner_h;
-            float ly = lbox_top + 30.0f;
-
+        // ==================================================================
+        else if ( m_tab == 4 ) {  // AUTOBOT
+            float ly = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Enable autobot", &m_autobot.enabled );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Enable autobot", &m_autobot.enabled, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Aim Spread", &m_autobot.aim_spread, 0.0f, 1.0f, "", "%.2f" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            sect( L_X + 14.f, ly, "PLAYBACK" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Target Accuracy", &m_autobot.target_accuracy, 85.f, 100.f, " %", "%.1f", CW );
+            tip( "The bot aims for this session accuracy." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Gameplay Flow", &m_autobot.gameplay_flow, nullptr, nullptr, CW );
+            tip( "Smoother, more musical motion between objects." );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Curve Strength", &m_autobot.curve_strength, 0.0f, 1.0f, "", "%.2f" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            sect( L_X + 14.f, ly, "AIM MOTION" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Aim Spread", &m_autobot.aim_spread, 0.f, 1.f, "", "%.2f", CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Curve Strength", &m_autobot.curve_strength, 0.f, 1.f, "", "%.2f", CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Momentum", &m_autobot.momentum, 0.f, .95f, "", "%.2f", CW );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Drift Amount", &m_autobot.drift_amount, 0.0f, 5.0f, "", "%.2f" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            sect( L_X + 14.f, ly, "IDLE MOTION" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Startup Motion", &m_autobot.startup_motion, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 1.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Break Motion", &m_autobot.break_motion, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 1.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Energetic Dances", &m_autobot.energetic_dances, nullptr, nullptr, CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Startup Energy", &m_autobot.startup_energy, 0.0f, 1.0f, "", "%.2f", CW );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Break Energy", &m_autobot.break_energy, 0.0f, 1.0f, "", "%.2f", CW );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Momentum", &m_autobot.momentum, 0.0f, 0.95f, "", "%.2f" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
-
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Slider Laziness", &m_autobot.slider_laziness, 0.0f, 1.0f, "", "%.2f" );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
-
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            slider_float( "Spinner RPM", &m_autobot.spinner_rpm, 200.0f, 477.0f, " rpm", "%.0f" );
+            sect( L_X + 14.f, ly, "OBJECTS" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Slider Laziness", &m_autobot.slider_laziness, 0.f, 1.f, "", "%.2f", CW );
+            tip( "Higher = stays near the slider ball's minimum path." );
+            ly = ImGui::GetCursorPos( ).y + 2.f;
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            slider_float( "Spinner RPM", &m_autobot.spinner_rpm, 200.f, 477.f, " rpm", "%.0f", CW );
             ly = ImGui::GetCursorPos( ).y;
 
-            const float lbox_bottom = ly + 12.0f;
+            const float lbot = ly + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "autobot options" );
+            draw_panel( dl, S( L_X, top0 ), S( L_X + COL_W, lbot ), "AUTOBOT" );
             dl->ChannelsMerge( );
 
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
-
+            // ---------- right: diagnostics ----------
+            float ry = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            if ( m_autobot.enabled && snap.game.cur_state == osu::game_state_t::play )
-                dl->AddText( S( R_X + 14.0f, ry ), IM_COL32( 100, 230, 160, 255 ), "Status: Running" );
-            else
-                dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "Status: Idle" );
-            ry += ImGui::GetTextLineHeight( ) + 8.0f;
+            const bool bot_running = m_autobot.enabled && snap.game.cur_state == osu::game_state_t::play;
+            kv( R_X + 14.f, ry, CW, "State", bot_running ? "running" : "idle",
+                bot_running ? theme::good() : theme::text_faint() );
 
-            const float rbox_bottom = ry + 12.0f;
+            const auto ad = m_autobot.diagnostics( );
+            char abuf[ 160 ]{};
+            sect( R_X + 14.f, ry, "TARGET ACCURACY" );
+            sprintf_s( abuf, "%.1f%%", ad.requested_accuracy );
+            kv( R_X + 14.f, ry, CW, "Target", abuf, theme::text_bright() );
+            sprintf_s( abuf, "%.2f%%", ad.predicted_accuracy );
+            const float acc_err = std::abs( ad.predicted_accuracy - ad.requested_accuracy );
+            kv( R_X + 14.f, ry, CW, "Projected final", abuf,
+                acc_err <= 0.75f ? theme::good() : acc_err <= 1.5f ? theme::warn() : theme::bad() );
+            sprintf_s( abuf, "%llu", static_cast<unsigned long long>( ad.controlled_100 ) );
+            kv( R_X + 14.f, ry, CW, "Controlled 100s", abuf );
+            sprintf_s( abuf, "%+.2f", ad.accuracy_debt );
+            kv( R_X + 14.f, ry, CW, "Outcome debt", abuf,
+                std::abs( ad.accuracy_debt ) < 1.2f ? theme::text_faint() : theme::warn() );
+            ry += 6.f;
+
+            // Random-jump instrumentation: internal discontinuities + the captured
+            // context of the most recent one, so a live jump can be diagnosed.
+            sect( R_X + 14.f, ry, "MOVEMENT INTEGRITY" );
+            const bool clean_motion = ad.internal_trajectory_discontinuities == 0 &&
+                ad.gameplay_owner_violations == 0 && ad.unexpected_offroute_replans == 0;
+            sprintf_s( abuf, "%llu", static_cast<unsigned long long>( m_autobot.bad_delta_count( ) ) );
+            kv( R_X + 14.f, ry, CW, "Off-trajectory events", abuf,
+                m_autobot.bad_delta_count( ) == 0 ? theme::good() : theme::bad() );
+            sprintf_s( abuf, "%llu / %llu",
+                static_cast<unsigned long long>( ad.gameplay_owner_violations ),
+                static_cast<unsigned long long>( ad.unexpected_offroute_replans ) );
+            kv( R_X + 14.f, ry, CW, "Owner viol / off-route", abuf,
+                clean_motion ? theme::text_faint() : theme::bad() );
+            sprintf_s( abuf, "%llu", static_cast<unsigned long long>( ad.owner_transition_replans ) );
+            kv( R_X + 14.f, ry, CW, "Owner-transition replans", abuf, theme::text_faint() );
+            autobot::bad_delta_trace_t bd{};
+            if ( m_autobot.last_bad_delta( bd ) ) {
+                const char* bd_owner =
+                    bd.owner == autobot::destination_owner_t::gameplay ? "GAMEPLAY" :
+                    bd.owner == autobot::destination_owner_t::slider ? "SLIDER" :
+                    bd.owner == autobot::destination_owner_t::spinner ? "SPINNER" :
+                    bd.owner == autobot::destination_owner_t::recovery ? "RECOVERY" :
+                    bd.owner == autobot::destination_owner_t::startup ? "STARTUP" :
+                    bd.owner == autobot::destination_owner_t::break_idle ? "BREAK_IDLE" :
+                    bd.owner == autobot::destination_owner_t::break_dance ? "BREAK_DANCE" : "NONE";
+                sprintf_s( abuf, "%.0f px  (bound %.0f)", bd.displacement, bd.kinematic_bound );
+                kv( R_X + 14.f, ry, CW, "Last jump", abuf, theme::warn() );
+                sprintf_s( abuf, "%s  obj %d", bd_owner, bd.object_index );
+                kv( R_X + 14.f, ry, CW, "  owner / object", abuf );
+                sprintf_s( abuf, "%s%s", bd.external_resync ? "resync " : "",
+                    bd.dt > 0.024f ? "dt-spike" : "internal" );
+                kv( R_X + 14.f, ry, CW, "  cause / dt", abuf );
+            }
+            ry += 6.f;
+
+            if ( fold( R_X + 14.f, ry, CW, "MOVEMENT TELEMETRY" ) ) {
+                const char* movement_state = "Idle";
+                switch ( m_autobot.movement_state( ) ) {
+                case autobot::movement_state_t::acquire: movement_state = "Acquire"; break;
+                case autobot::movement_state_t::travel: movement_state = "Travel"; break;
+                case autobot::movement_state_t::arrival: movement_state = "Arrival"; break;
+                case autobot::movement_state_t::slider_entry: movement_state = "Slider entry"; break;
+                case autobot::movement_state_t::slider_follow: movement_state = "Slider follow"; break;
+                case autobot::movement_state_t::slider_exit: movement_state = "Slider exit"; break;
+                case autobot::movement_state_t::spinner_entry: movement_state = "Spinner entry"; break;
+                case autobot::movement_state_t::spinner_sustain: movement_state = "Spinner sustain"; break;
+                case autobot::movement_state_t::spinner_exit: movement_state = "Spinner exit"; break;
+                case autobot::movement_state_t::break_idle: movement_state = "Break idle"; break;
+                default: break;
+                }
+                const char* destination_owner = "NONE";
+                switch ( m_autobot.destination_owner( ) ) {
+                case autobot::destination_owner_t::gameplay: destination_owner = "GAMEPLAY"; break;
+                case autobot::destination_owner_t::slider: destination_owner = "SLIDER"; break;
+                case autobot::destination_owner_t::spinner: destination_owner = "SPINNER"; break;
+                case autobot::destination_owner_t::startup: destination_owner = "STARTUP"; break;
+                case autobot::destination_owner_t::break_idle: destination_owner = "BREAK_IDLE"; break;
+                case autobot::destination_owner_t::break_dance: destination_owner = "BREAK_DANCE"; break;
+                case autobot::destination_owner_t::recovery: destination_owner = "RECOVERY"; break;
+                default: break; }
+                const auto source_name = []( autobot::destination_source_t source ) { switch ( source ) {
+                    case autobot::destination_source_t::gameplay_trajectory: return "GAMEPLAY";
+                    case autobot::destination_source_t::slider_follow: return "SLIDER";
+                    case autobot::destination_source_t::spinner_orbit: return "SPINNER";
+                    case autobot::destination_source_t::startup_choreography: return "STARTUP";
+                    case autobot::destination_source_t::break_choreography: return "BREAK_DANCE";
+                    case autobot::destination_source_t::break_rest: return "BREAK_REST";
+                    case autobot::destination_source_t::recovery: return "RECOVERY";
+                    case autobot::destination_source_t::external_resync: return "RESYNC";
+                    default: return "NONE"; } };
+                const auto source_reason = []( autobot::source_change_reason_t reason ) { switch ( reason ) {
+                    case autobot::source_change_reason_t::target_change: return "TARGET_CHANGE";
+                    case autobot::source_change_reason_t::material_schedule_change: return "SCHEDULE_CHANGE";
+                    case autobot::source_change_reason_t::state_change: return "STATE_CHANGE";
+                    case autobot::source_change_reason_t::choreography_start: return "CHOREO_START";
+                    case autobot::source_change_reason_t::choreography_segment: return "CHOREO_SEGMENT";
+                    case autobot::source_change_reason_t::acquisition_deadline: return "ACQ_DEADLINE";
+                    case autobot::source_change_reason_t::recovery_required: return "RECOVERY";
+                    case autobot::source_change_reason_t::external_resync: return "RESYNC";
+                    case autobot::source_change_reason_t::invalid_trajectory: return "INVALID_TRAJ";
+                    default: return "NONE"; } };
+                const auto replan_reason = []( autobot::replan_reason_t reason ) { switch ( reason ) {
+                    case autobot::replan_reason_t::target_change: return "TARGET_CHANGE";
+                    case autobot::replan_reason_t::material_schedule_change: return "SCHEDULE_CHANGE";
+                    case autobot::replan_reason_t::state_change: return "STATE_CHANGE";
+                    case autobot::replan_reason_t::recovery_required: return "RECOVERY";
+                    case autobot::replan_reason_t::slider_change: return "SLIDER_CHANGE";
+                    case autobot::replan_reason_t::spinner_change: return "SPINNER_CHANGE";
+                    case autobot::replan_reason_t::invalid_trajectory: return "INVALID_TRAJ";
+                    case autobot::replan_reason_t::choreography_segment: return "CHOREO_SEGMENT";
+                    default: return "NONE"; } };
+
+                kv( R_X + 14.f, ry, CW, "Movement state", movement_state );
+                kv( R_X + 14.f, ry, CW, "Destination owner", destination_owner );
+                sprintf_s( abuf, "%s (prev %s)", source_name( ad.current_source ), source_name( ad.previous_source ) );
+                kv( R_X + 14.f, ry, CW, "Source", abuf );
+                kv( R_X + 14.f, ry, CW, "Source reason", source_reason( ad.source_change_reason ) );
+                sprintf_s( abuf, "%llu / %d", ad.trajectory_id, ad.source_object_index );
+                kv( R_X + 14.f, ry, CW, "Trajectory / object", abuf );
+                const bool clean = ad.gameplay_owner_violations == 0 && ad.unexpected_offroute_replans == 0 && ad.target_point_mutations == 0;
+                sprintf_s( abuf, "%llu / %llu / %llu",
+                    ad.gameplay_owner_violations, ad.unexpected_offroute_replans, ad.target_point_mutations );
+                kv( R_X + 14.f, ry, CW, "Owner / off-route / mut.", abuf, clean ? theme::text_faint() : theme::bad() );
+                sprintf_s( abuf, "%s (%llu)", replan_reason( ad.last_replan_reason ), ad.movement_replans );
+                kv( R_X + 14.f, ry, CW, "Replan last / total", abuf );
+                sprintf_s( abuf, "%llu/%llu/%llu/%llu/%llu",
+                    ad.target_change_replans, ad.timing_update_replans, ad.slider_state_replans,
+                    ad.recovery_replans, ad.invalid_data_replans );
+                kv( R_X + 14.f, ry, CW, "Replans T/Tm/S/R/I", abuf );
+                sprintf_s( abuf, "%llu / %llu", ad.external_resync_events, ad.internal_trajectory_discontinuities );
+                kv( R_X + 14.f, ry, CW, "Resync / discontinuity", abuf,
+                    ( ad.external_resync_events || ad.internal_trajectory_discontinuities ) ? theme::warn() : theme::text_faint() );
+                sprintf_s( abuf, "%.1f, %.1f", ad.internal_desired_delta.x, ad.internal_desired_delta.y );
+                kv( R_X + 14.f, ry, CW, "Internal delta", abuf );
+                sprintf_s( abuf, "%.1f, %.1f", ad.final_requested_delta.x, ad.final_requested_delta.y );
+                kv( R_X + 14.f, ry, CW, "Final OS delta", abuf );
+                sprintf_s( abuf, "%.1f, %.1f", ad.observed_cursor_delta.x, ad.observed_cursor_delta.y );
+                kv( R_X + 14.f, ry, CW, "Observed delta", abuf );
+                sprintf_s( abuf, "%llu / %llu", ad.startup_primitives_generated, ad.break_primitives_generated );
+                kv( R_X + 14.f, ry, CW, "Startup / break prims", abuf );
+                sprintf_s( abuf, "%llu", ad.decorative_interruptions );
+                kv( R_X + 14.f, ry, CW, "Decorative interrupts", abuf, ad.decorative_interruptions ? 0 : theme::text_faint() );
+            }
+
+            const float rbot = ry + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "diagnostics" );
+            draw_panel( dl, S( R_X, top0 ), S( R_X + COL_W, rbot ), "DIAGNOSTICS" );
             dl->ChannelsMerge( );
         }
-         else if ( m_tab == 5 ) {
-             const float lbox_top = TITLE_H + 14.0f + content_slide + replay_banner_h;
-            float ly = lbox_top + 30.0f;
-
+        // ==================================================================
+        else if ( m_tab == 5 ) {  // SYSTEM
+            float ly = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
-
-            dl->AddText( S( L_X + 14.0f, ly ), theme::text_bright(), "Gameplay & Menu Keybinds:" );
-            ly += ImGui::GetTextLineHeight( ) + 8.0f;
 
             char left_buf[ 16 ]{}, right_buf[ 16 ]{}, menu_buf[ 16 ]{};
             GetKeyNameTextA( MapVirtualKeyA( m_custom_left_key, MAPVK_VK_TO_VSC ) << 16, left_buf, sizeof( left_buf ) );
@@ -1509,15 +1841,18 @@ namespace ui {
                 else sprintf_s( menu_buf, "0x%02X", m_menu_keybind );
             }
 
-            if ( m_waiting_left ) {
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                button( "Press key...##lbtn", L_W - 24.0f, 22.0f );
+            sect( L_X + 14.f, ly, "KEYBINDS" );
+
+            auto capture_key = [&]( int& slot, bool& waiting_flag, bool is_menu_key ) {
                 for ( int k = 8; k < 256; ++k ) {
                     if ( k == VK_LBUTTON || k == VK_RBUTTON || k == VK_MBUTTON ) continue;
                     if ( GetAsyncKeyState( k ) & 0x8000 ) {
-                        m_custom_left_key = k;
-                        m_waiting_left = false;
-                        if ( m_relax.is_active( ) ) {
+                        slot = k;
+                        waiting_flag = false;
+                        // swallow this press so the freshly bound key can't
+                        // instantly toggle the menu on the next frame
+                        if ( is_menu_key ) m_menu_key_was_down = true;
+                        if ( !is_menu_key && m_relax.is_active( ) ) {
                             osu::game_snapshot_t mod = snap.game;
                             apply_custom_keys( mod );
                             m_relax.on_leave_play( mod );
@@ -1525,134 +1860,87 @@ namespace ui {
                         break;
                     }
                 }
-            }
-            else {
-                const std::string lbl = std::string( "Left Key: " ) + left_buf + "##lbtn";
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                if ( button( lbl.c_str( ), L_W - 24.0f, 22.0f ) ) {
-                    m_waiting_left = true; m_waiting_right = false; m_waiting_menu = false;
-                }
-            }
-            ly += 26.0f;
+            };
 
-            if ( m_waiting_right ) {
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                button( "Press key...##rbtn", L_W - 24.0f, 22.0f );
-                for ( int k = 8; k < 256; ++k ) {
-                    if ( k == VK_LBUTTON || k == VK_RBUTTON || k == VK_MBUTTON ) continue;
-                    if ( GetAsyncKeyState( k ) & 0x8000 ) {
-                        m_custom_right_key = k;
-                        m_waiting_right = false;
-                        if ( m_relax.is_active( ) ) {
-                            osu::game_snapshot_t mod = snap.game;
-                            apply_custom_keys( mod );
-                            m_relax.on_leave_play( mod );
-                        }
-                        break;
-                    }
-                }
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            if ( key_pill( "##bind_left", "Left key", left_buf, m_waiting_left, CW ) ) {
+                m_waiting_left = !m_waiting_left; m_waiting_right = false; m_waiting_menu = false;
             }
-            else {
-                const std::string lbl = std::string( "Right Key: " ) + right_buf + "##rbtn";
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                if ( button( lbl.c_str( ), L_W - 24.0f, 22.0f ) ) {
-                    m_waiting_right = true; m_waiting_left = false; m_waiting_menu = false;
-                }
-            }
-            ly += 26.0f;
+            if ( m_waiting_left ) capture_key( m_custom_left_key, m_waiting_left, false );
+            ly = ImGui::GetCursorPos( ).y;
 
-            if ( m_waiting_menu ) {
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                button( "Press key...##menubtn", L_W - 24.0f, 22.0f );
-                for ( int k = 8; k < 256; ++k ) {
-                    if ( k == VK_LBUTTON || k == VK_RBUTTON || k == VK_MBUTTON ) continue;
-                    if ( GetAsyncKeyState( k ) & 0x8000 ) {
-                        m_menu_keybind = k;
-                        m_waiting_menu = false;
-                        break;
-                    }
-                }
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            if ( key_pill( "##bind_right", "Right key", right_buf, m_waiting_right, CW ) ) {
+                m_waiting_right = !m_waiting_right; m_waiting_left = false; m_waiting_menu = false;
             }
-            else {
-                const std::string lbl = std::string( "Menu Toggle Key: " ) + menu_buf + "##menubtn";
-                ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-                if ( button( lbl.c_str( ), L_W - 24.0f, 22.0f ) ) {
-                    m_waiting_menu = true; m_waiting_left = false; m_waiting_right = false;
-                }
+            if ( m_waiting_right ) capture_key( m_custom_right_key, m_waiting_right, false );
+            ly = ImGui::GetCursorPos( ).y;
+
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            if ( key_pill( "##bind_menu", "Menu toggle", menu_buf, m_waiting_menu, CW ) ) {
+                m_waiting_menu = !m_waiting_menu; m_waiting_left = false; m_waiting_right = false;
             }
-            ly += 28.0f;
+            if ( m_waiting_menu ) capture_key( m_menu_keybind, m_waiting_menu, true );
+            ly = ImGui::GetCursorPos( ).y + 8.f;
 
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            checkbox( "Stream proof", &stream_proof );
-            ly = ImGui::GetCursorPos( ).y + 4.0f;
+            sect( L_X + 14.f, ly, "OPTIONS" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            checkbox( "Stream proof", &stream_proof, nullptr, nullptr, CW );
+            tip( "Hides the overlay from screen capture and recordings." );
+            ly = ImGui::GetCursorPos( ).y + 4.f;
 
-            const float lbox_bottom = ly + 12.0f;
+            const float lbot = ly + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "gameplay bindings" );
+            draw_panel( dl, S( L_X, top0 ), S( L_X + COL_W, lbot ), "BINDINGS" );
             dl->ChannelsMerge( );
 
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
-
+            // ---------- right: client status ----------
+            float ry = top0 + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
             const char* client = "none";
             if ( snap.game.client == osu::client_kind_t::stable ) client = "osu!stable";
             else if ( snap.game.client == osu::client_kind_t::lazer ) client = "osu!lazer";
-
             const bool osu_wnd = input::target_window( ) && IsWindow( input::target_window( ) );
 
             char buf[ 128 ];
-            sprintf_s( buf, "Osu window: %s", osu_wnd ? "found" : "not found" );
-            dl->AddText( S( R_X + 14.0f, ry ), osu_wnd ? IM_COL32( 100, 230, 160, 255 ) : theme::text_dim(), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
+            sect( R_X + 14.f, ry, "CLIENT" );
+            kv( R_X + 14.f, ry, CW, "Window", osu_wnd ? "found" : "not found", osu_wnd ? theme::good() : theme::text_faint() );
+            kv( R_X + 14.f, ry, CW, "Client", client, snap.game.client == osu::client_kind_t::none ? theme::text_faint() : theme::text_bright() );
+            sprintf_s( buf, "%d", snap.game.pid );
+            kv( R_X + 14.f, ry, CW, "Attached PID", buf, snap.game.pid ? 0 : theme::text_faint() );
+            if ( snap.game.cur_state == osu::game_state_t::play ) sprintf_s( buf, "%d ms", snap.game.cur_time );
+            else sprintf_s( buf, "--" );
+            kv( R_X + 14.f, ry, CW, "Time", buf );
+            ry += 6.f;
 
-            sprintf_s( buf, "Client: %s", client );
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_bright(), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
+            sect( R_X + 14.f, ry, "INPUT PATH" );
+            kv( R_X + 14.f, ry, CW, "Aim mouse hook",
+                m_mouse_hook.installed( ) ? "active" : "poll fallback",
+                m_mouse_hook.installed( ) ? theme::good() : theme::warn() );
+            kv( R_X + 14.f, ry, CW, "Mouse input", input::using_nt_input( ) ? "win32u" : "SendInput" );
+            ry += 6.f;
 
-            sprintf_s( buf, "Attached PID: %d", snap.game.pid );
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text(), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
-            if ( snap.game.cur_state == osu::game_state_t::play )
-                sprintf_s( buf, "Time: %d ms", snap.game.cur_time );
-            else sprintf_s( buf, "Time: --" );
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text(), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
-            sprintf_s( buf, "Aim mouse hook: %s", m_mouse_hook.installed( ) ? "active" : "failed (poll fallback)" );
-            dl->AddText( S( R_X + 14.0f, ry ),
-                m_mouse_hook.installed( ) ? IM_COL32( 100, 230, 160, 255 ) : IM_COL32( 255, 200, 100, 255 ), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
-            sprintf_s( buf, "Mouse input: %s", input::using_nt_input( ) ? "win32u" : "SendInput" );
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text(), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
-            sprintf_s( buf, "Beatmap: %s | objects: %zu",
-                snap.beatmap.loaded ? "loaded" : "NOT LOADED", snap.beatmap.objects.size( ) );
-            dl->AddText( S( R_X + 14.0f, ry ), snap.beatmap.loaded ? theme::text_bright() : IM_COL32( 255, 150, 120, 255 ), buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-
+            sect( R_X + 14.f, ry, "BEATMAP" );
+            kv( R_X + 14.f, ry, CW, "State", snap.beatmap.loaded ? "loaded" : "not loaded",
+                snap.beatmap.loaded ? theme::good() : theme::text_faint() );
+            sprintf_s( buf, "%zu", snap.beatmap.objects.size( ) );
+            kv( R_X + 14.f, ry, CW, "Objects", buf );
             if ( snap.beatmap.loaded ) {
-                sprintf_s( buf, "CS: %.1f | OD: %.1f | AR: %.1f", snap.beatmap.cs, snap.beatmap.od, snap.beatmap.ar );
-                dl->AddText( S( R_X + 14.0f, ry ), theme::text_bright(), buf );
-                ry += ImGui::GetTextLineHeight( ) + 4.0f;
+                sprintf_s( buf, "%.1f / %.1f / %.1f", snap.beatmap.cs, snap.beatmap.od, snap.beatmap.ar );
+                kv( R_X + 14.f, ry, CW, "CS / OD / AR", buf );
             }
 
             if ( snap.game.client == osu::client_kind_t::stable ) {
-                dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "Songs path override:" );
-                ry += ImGui::GetTextLineHeight( ) + 4.0f;
+                ry += 6.f;
+                sect( R_X + 14.f, ry, "SONGS PATH OVERRIDE" );
+                ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+                text_input( "##songs_override", m_songs_path_utf8, IM_ARRAYSIZE( m_songs_path_utf8 ), CW );
+                ry += 28.f;
 
-                ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-                text_input( "##songs_override", m_songs_path_utf8, IM_ARRAYSIZE( m_songs_path_utf8 ), R_W - 24.0f );
-                ry = ImGui::GetCursorPos( ).y + 6.0f;
-
-                ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-                if ( button( "Browse##songs", R_W - 24.0f, 22.0f ) ) {
+                ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+                if ( button( "Browse##songs", CW * 0.5f - 3.f, 22.0f ) ) {
                     BROWSEINFOW bi{};
                     wchar_t buffer[ MAX_PATH ]{};
                     bi.lpszTitle = L"Select osu! Songs folder";
@@ -1663,40 +1951,36 @@ namespace ui {
                         CoTaskMemFree( pidl );
                     }
                 }
-                ry = ImGui::GetCursorPos( ).y + 4.0f;
-
-                ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-                if ( button( "Apply Override", R_W - 24.0f, 22.0f ) && m_cache && m_songs_path_utf8[ 0 ] ) {
+                ImGui::SetCursorPos( ImVec2( R_X + 14.f + CW * 0.5f + 3.f, ry ) );
+                if ( button( "Apply##songs", CW * 0.5f - 3.f, 22.0f ) && m_cache && m_songs_path_utf8[ 0 ] ) {
                     wchar_t wide[ 512 ]{};
                     MultiByteToWideChar( CP_UTF8, 0, m_songs_path_utf8, -1, wide, 512 );
                     m_cache->stable_parser( ).set_songs_path( wide );
                     m_cache->invalidate_beatmap_cache( );
                 }
-                ry = ImGui::GetCursorPos( ).y;
+                ry += 26.f;
             }
 
-            const float rbox_bottom = ry + 12.0f;
+            const float rbot = ry + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "system diagnostic" );
+            draw_panel( dl, S( R_X, top0 ), S( R_X + COL_W, rbot ), "SYSTEM STATUS" );
             dl->ChannelsMerge( );
         }
-        else if ( m_tab == 6 ) {
+        // ==================================================================
+        else if ( m_tab == 6 ) {  // CONFIG
             if ( m_config_profiles.empty( ) )
                 m_config_profiles = config::list_profiles( );
 
-            const float lbox_top = TITLE_H + 14.0f + content_slide;
-            float ly = lbox_top + 30.0f;
+            const float ctop = HDR_H + 12.f + slide;
+            float ly = ctop + 36.f;
 
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            dl->AddText( S( L_X + 14.0f, ly ), theme::text_bright(), "Saved configs:" );
-            ly += ImGui::GetTextLineHeight( ) + 6.0f;
-
-            ImGui::SetCursorPos( ImVec2( L_X + 12.0f, ly ) );
-            const float list_h = MENU_H - ly - 80.0f;
-            if ( ImGui::BeginListBox( "##cfg_list", ImVec2( L_W - 24.0f, list_h ) ) ) {
+            sect( L_X + 14.f, ly, "SAVED PROFILES" );
+            ImGui::SetCursorPos( ImVec2( L_X + 14.f, ly ) );
+            const float list_h = H - ly - 92.0f;
+            if ( ImGui::BeginListBox( "##cfg_list", ImVec2( CW, list_h ) ) ) {
                 for ( int i = 0; i < static_cast<int>( m_config_profiles.size( ) ); ++i ) {
                     const bool selected = ( m_config_selected == i );
                     if ( ImGui::Selectable( m_config_profiles[ static_cast<size_t>( i ) ].c_str( ), selected ) ) {
@@ -1706,33 +1990,30 @@ namespace ui {
                 }
                 ImGui::EndListBox( );
             }
-            ly = ImGui::GetCursorPos( ).y + 8.0f;
+            ly += list_h + 10.f;
 
             if ( !m_config_status.empty( ) ) {
-                dl->AddText( S( L_X + 14.0f, ly ), theme::text_dim(), m_config_status.c_str( ) );
-                ly += ImGui::GetTextLineHeight( ) + 4.0f;
+                dl->AddText( theme::font_small, theme::font_small->LegacySize, S( L_X + 14.f, ly ),
+                    theme::fade( theme::text_dim() ), m_config_status.c_str( ) );
+                ly += theme::font_small->LegacySize + 4.f;
             }
 
-            const float lbox_bottom = ly + 12.0f;
+            const float lbot = ly + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(L_X, lbox_top), S(L_X + L_W, lbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( L_X + 14.0f, lbox_top + 8.0f ), theme::text_accent(), "profiles" );
+            draw_panel( dl, S( L_X, ctop ), S( L_X + COL_W, lbot ), "PROFILES" );
             dl->ChannelsMerge( );
 
-            const float rbox_top = TITLE_H + 14.0f;
-            float ry = rbox_top + 30.0f;
+            float ry = ctop + 36.f;
             dl->ChannelsSplit( 2 );
             dl->ChannelsSetCurrent( 1 );
 
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "New configuration name:" );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
+            sect( R_X + 14.f, ry, "PROFILE NAME" );
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            text_input( "##cfg_name", m_config_name_utf8, IM_ARRAYSIZE( m_config_name_utf8 ), CW );
+            ry += 30.f;
 
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            text_input( "##cfg_name", m_config_name_utf8, IM_ARRAYSIZE( m_config_name_utf8 ), R_W - 24.0f );
-            ry = ImGui::GetCursorPos( ).y + 7.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            if ( button( "Save", R_W - 24.0f, 22.0f ) ) {
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            if ( button( "Save", CW * 0.5f - 3.f, 24.0f ) ) {
                 const std::string name = config::sanitize_name( m_config_name_utf8 );
                 if ( name.empty( ) ) m_config_status = "Enter a config name first.";
                 else if ( config::save_profile( name, capture_settings( ) ) ) {
@@ -1742,10 +2023,8 @@ namespace ui {
                 }
                 else m_config_status = "Failed to save config.";
             }
-            ry = ImGui::GetCursorPos( ).y + 5.0f;
-
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            if ( button( "Load", R_W - 24.0f, 22.0f ) ) {
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f + CW * 0.5f + 3.f, ry ) );
+            if ( button( "Load", CW * 0.5f - 3.f, 24.0f ) ) {
                 std::string name = config::sanitize_name( m_config_name_utf8 );
                 if ( name.empty( ) && m_config_selected >= 0 && m_config_selected < static_cast<int>( m_config_profiles.size( ) ) )
                     name = m_config_profiles[ static_cast<size_t>( m_config_selected ) ];
@@ -1759,40 +2038,42 @@ namespace ui {
                 }
                 else m_config_status = "Config not found.";
             }
-            ry = ImGui::GetCursorPos( ).y + 5.0f;
+            ry += 30.f;
 
-            ImGui::SetCursorPos( ImVec2( R_X + 12.0f, ry ) );
-            if ( button( "Refresh list", R_W - 24.0f, 22.0f ) ) {
+            ImGui::SetCursorPos( ImVec2( R_X + 14.f, ry ) );
+            if ( button( "Refresh list", CW, 22.0f ) ) {
                 m_config_profiles = config::list_profiles( );
                 m_config_status = "Profile list refreshed.";
             }
-            ry = ImGui::GetCursorPos( ).y + 12.0f;
+            ry += 34.f;
 
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "Saves all module settings," );
-            ry += ImGui::GetTextLineHeight( ) + 2.0f;
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "keys, replay path, and system options." );
-            ry += ImGui::GetTextLineHeight( ) + 8.0f;
+            dl->AddText( theme::font_small, theme::font_small->LegacySize, S( R_X + 14.f, ry ),
+                theme::fade( theme::text_dim() ), "Saves all module settings, keys,\nreplay path and system options." );
+            ry += theme::font_small->LegacySize * 2.f + 12.f;
 
             char path_buf[ 512 ]{};
             WideCharToMultiByte( CP_UTF8, 0, config::configs_dir( ).wstring( ).c_str( ), -1, path_buf, sizeof( path_buf ), nullptr, nullptr );
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text_dim(), "Folder:" );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
-            dl->AddText( S( R_X + 14.0f, ry ), theme::text(), path_buf );
-            ry += ImGui::GetTextLineHeight( ) + 4.0f;
+            sect( R_X + 14.f, ry, "FOLDER" );
+            dl->AddText( theme::font_small, theme::font_small->LegacySize, S( R_X + 14.f, ry ),
+                theme::fade( theme::text() ), path_buf );
+            ry += theme::font_small->LegacySize + 4.f;
 
-            const float rbox_bottom = ry + 12.0f;
+            const float rbot = ry + 12.f;
             dl->ChannelsSetCurrent( 0 );
-            draw_glass_card( dl, S(R_X, rbox_top), S(R_X + R_W, rbox_bottom), 8.0f, theme::accent() );
-            dl->AddText( S( R_X + 14.0f, rbox_top + 8.0f ), theme::text_accent(), "config files" );
+            draw_panel( dl, S( R_X, ctop ), S( R_X + COL_W, rbot ), "MANAGE" );
             dl->ChannelsMerge( );
         }
 
+        theme::content_mul = 1.f;
+
         render_open_dropdown( );
         render_open_color_picker( );
+        render_tooltip( );
 
         ImGui::SetCursorPos( ImVec2( wsize.x, wsize.y ) );
         ImGui::Dummy( ImVec2( 1.0f, 1.0f ) );
 
+        ImGui::PopStyleVar( ); // alpha
         ImGui::End( );
     }
 }

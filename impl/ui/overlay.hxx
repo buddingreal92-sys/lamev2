@@ -106,18 +106,17 @@ namespace ui {
         bool m_menu_dragged = false;
         bool m_streamproof_hide_cursor = false;
 
+        // Menu visibility architecture:
+        //   m_visible        — the single authoritative *logical* state.
+        //                      DEL and the X button both write only this.
+        //   m_menu_open_anim — *visual* transition progress (0..1) that
+        //                      eases toward m_visible every frame. It never
+        //                      writes back to m_visible.
+        // The menu renders while m_visible || m_menu_open_anim > 0.
         float m_anim_time = 0.f;
         float m_menu_open_anim = 0.f;
-        bool m_menu_was_open = false;
 
-
-
-        struct trail_point_t {
-            float x = 0.f;
-            float y = 0.f;
-            double time = 0.0;
-        };
-        std::vector<trail_point_t> m_cursor_history;
+        [[nodiscard]] bool render_visible( ) const { return m_visible || m_menu_open_anim > 0.001f; }
 
         static LRESULT CALLBACK wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp );
         bool init_d3d( );
