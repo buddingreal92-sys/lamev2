@@ -1,0 +1,13 @@
+﻿  core.cxx
+  lzma_helper.cpp
+  imgui_demo.cpp
+  overlay.cxx
+  imgui.cpp
+  imgui_draw.cpp
+  imgui_tables.cpp
+  imgui_widgets.cpp
+  imgui_impl_win32.cpp
+  imgui_impl_dx11.cpp
+  Generating Code...
+  LzmaDec.c
+  lame.vcxproj -> C:\Users\Etern\Downloads\lame_lazer_2026.804.2_SLIDER_TAIL_FIX\lame\builds\x64\Debug\lame.exe

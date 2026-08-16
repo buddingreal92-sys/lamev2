@@ -1,0 +1,9 @@
+osu!lazer 2026.804.2 slider-tail compatibility fix
+
+Changes from AUTORESOLVE_RELAX:
+- Stops using the old obj+0xD0 heuristic to decide whether a hit object has duration.
+- Detects sliders/spinners from their real NestedHitObjects timeline.
+- Reuses the auto-resolved StartTimeBindable / Bindable<double> value offsets for nested objects.
+- Auto-resolves the NestedHitObjects list field near its old location and caches it.
+
+This specifically targets Relax releasing some sliders like normal circles (~48 ms) instead of holding to the slider tail.

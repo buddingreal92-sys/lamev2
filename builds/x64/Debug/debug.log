@@ -1,0 +1,12 @@
+[02:41:44.945] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=446
+[02:41:44.947] lazer nested duration field resolved: 0x28
+[02:42:50.172] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=945
+[02:45:05.125] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=731
+[02:46:57.219] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1083
+[03:20:54.411] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1564
+[03:21:19.693] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1564
+[03:21:32.787] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1564
+[03:22:14.570] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1535
+[03:22:22.471] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1535
+[03:22:35.038] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1535
+[03:22:44.692] lazer chain resolved: player_drawable=0x458 drawable_beatmap=0x380 beatmap_hitobjects=0x28 start_bindable=0x10 bindable_value=0x40 count=1097
