@@ -269,7 +269,7 @@ namespace ui {
         RegisterClassExW( &wc );
 
         m_hwnd = CreateWindowExW(
-            WS_EX_APPWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST,
+            WS_EX_APPWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             wc.lpszClassName, L"  ", WS_POPUP,
             0, 0, MENU_W, MENU_H,
             nullptr, nullptr, instance, this );
@@ -279,7 +279,7 @@ namespace ui {
         enable_backdrop_blur( m_hwnd );
         SetLayeredWindowAttributes( m_hwnd, 0, 255, LWA_ALPHA );
 
-        ShowWindow( m_hwnd, SW_SHOWDEFAULT );
+        ShowWindow( m_hwnd, SW_SHOWNA );
         UpdateWindow( m_hwnd );
 
         if ( !init_d3d( ) ) return false;
@@ -374,6 +374,12 @@ namespace ui {
             if ( msg.message == WM_QUIT )
                 return false;
         }
+
+        // The title-bar X requests a full application exit.  Returning false
+        // here stops the main pump loop, which then runs the normal cleanup
+        // (cache.stop() + overlay.destroy()).  One close path, no WM_CLOSE race.
+        if ( m_exit_requested )
+            return false;
 
         if ( stream_proof )
             SetWindowDisplayAffinity( m_hwnd, WDA_EXCLUDEFROMCAPTURE );
@@ -474,6 +480,11 @@ namespace ui {
     }
 
     LRESULT CALLBACK c_overlay::wnd_proc( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp ) {
+        // The menu receives mouse messages but must never take foreground focus
+        // from osu!.  Lazer changes its top screen when it loses focus, which
+        // otherwise makes its existing player-screen state test report menu.
+        if ( msg == WM_MOUSEACTIVATE )
+            return MA_NOACTIVATE;
         if ( ImGui_ImplWin32_WndProcHandler( hwnd, msg, wp, lp ) )
             return true;
 
@@ -1118,7 +1129,8 @@ namespace ui {
             dl->AddLine( ImVec2( xc.x - 4.f, xc.y - 4.f ), ImVec2( xc.x + 4.f, xc.y + 4.f ), xcol, 1.4f );
             dl->AddLine( ImVec2( xc.x - 4.f, xc.y + 4.f ), ImVec2( xc.x + 4.f, xc.y - 4.f ), xcol, 1.4f );
             if ( ImGui::IsItemClicked( ImGuiMouseButton_Left ) ) {
-                m_visible = false;
+                // X exits the whole application (not just hide the menu).
+                m_exit_requested = true;
                 close_transient_ui( );
             }
         }
@@ -1686,128 +1698,70 @@ namespace ui {
                 std::abs( ad.accuracy_debt ) < 1.2f ? theme::text_faint() : theme::warn() );
             ry += 6.f;
 
-            // Random-jump instrumentation: internal discontinuities + the captured
-            // context of the most recent one, so a live jump can be diagnosed.
+            // ---- active plan (the single authoritative movement intent) ----
+            sect( R_X + 14.f, ry, "ACTIVE PLAN" );
+            sprintf_s( abuf, "%s  #%llu", autobot::plan_type_name( ad.plan_type ),
+                static_cast<unsigned long long>( ad.plan_id ) );
+            kv( R_X + 14.f, ry, CW, "Plan / id", abuf, theme::text_bright() );
+            sprintf_s( abuf, "%d", ad.object_index );
+            kv( R_X + 14.f, ry, CW, "Object index", abuf );
+            sprintf_s( abuf, "%.0f%%   %.0f ms", ad.plan_progress * 100.f, ad.time_to_arrival_ms );
+            kv( R_X + 14.f, ry, CW, "Progress / to arrival", abuf );
+            sprintf_s( abuf, "%.0f, %.0f", ad.motion_position.x, ad.motion_position.y );
+            kv( R_X + 14.f, ry, CW, "Motion position", abuf );
+            sprintf_s( abuf, "%.0f, %.0f", ad.target_position.x, ad.target_position.y );
+            kv( R_X + 14.f, ry, CW, "Target position", abuf );
+            sprintf_s( abuf, "%.0f px/s   %.0f px/s2", ad.speed, ad.acceleration );
+            kv( R_X + 14.f, ry, CW, "Speed / accel", abuf );
+            sprintf_s( abuf, "%d,%d  vs  %d,%d", ad.requested_screen_x, ad.requested_screen_y,
+                ad.observed_screen_x, ad.observed_screen_y );
+            kv( R_X + 14.f, ry, CW, "Requested / observed", abuf );
+            ry += 6.f;
+
+            // ---- integrity: exactly one invariant matters -> discontinuities ----
             sect( R_X + 14.f, ry, "MOVEMENT INTEGRITY" );
-            const bool clean_motion = ad.internal_trajectory_discontinuities == 0 &&
-                ad.gameplay_owner_violations == 0 && ad.unexpected_offroute_replans == 0;
-            sprintf_s( abuf, "%llu", static_cast<unsigned long long>( m_autobot.bad_delta_count( ) ) );
-            kv( R_X + 14.f, ry, CW, "Off-trajectory events", abuf,
-                m_autobot.bad_delta_count( ) == 0 ? theme::good() : theme::bad() );
-            sprintf_s( abuf, "%llu / %llu",
-                static_cast<unsigned long long>( ad.gameplay_owner_violations ),
-                static_cast<unsigned long long>( ad.unexpected_offroute_replans ) );
-            kv( R_X + 14.f, ry, CW, "Owner viol / off-route", abuf,
-                clean_motion ? theme::text_faint() : theme::bad() );
-            sprintf_s( abuf, "%llu", static_cast<unsigned long long>( ad.owner_transition_replans ) );
-            kv( R_X + 14.f, ry, CW, "Owner-transition replans", abuf, theme::text_faint() );
-            autobot::bad_delta_trace_t bd{};
-            if ( m_autobot.last_bad_delta( bd ) ) {
-                const char* bd_owner =
-                    bd.owner == autobot::destination_owner_t::gameplay ? "GAMEPLAY" :
-                    bd.owner == autobot::destination_owner_t::slider ? "SLIDER" :
-                    bd.owner == autobot::destination_owner_t::spinner ? "SPINNER" :
-                    bd.owner == autobot::destination_owner_t::recovery ? "RECOVERY" :
-                    bd.owner == autobot::destination_owner_t::startup ? "STARTUP" :
-                    bd.owner == autobot::destination_owner_t::break_idle ? "BREAK_IDLE" :
-                    bd.owner == autobot::destination_owner_t::break_dance ? "BREAK_DANCE" : "NONE";
-                sprintf_s( abuf, "%.0f px  (bound %.0f)", bd.displacement, bd.kinematic_bound );
-                kv( R_X + 14.f, ry, CW, "Last jump", abuf, theme::warn() );
-                sprintf_s( abuf, "%s  obj %d", bd_owner, bd.object_index );
-                kv( R_X + 14.f, ry, CW, "  owner / object", abuf );
-                sprintf_s( abuf, "%s%s", bd.external_resync ? "resync " : "",
-                    bd.dt > 0.024f ? "dt-spike" : "internal" );
-                kv( R_X + 14.f, ry, CW, "  cause / dt", abuf );
+            sprintf_s( abuf, "%llu", static_cast<unsigned long long>( ad.unexpected_discontinuities ) );
+            kv( R_X + 14.f, ry, CW, "Discontinuities", abuf,
+                ad.unexpected_discontinuities == 0 ? theme::good() : theme::bad() );
+            sprintf_s( abuf, "%.0f px", ad.max_frame_displacement );
+            kv( R_X + 14.f, ry, CW, "Max frame move", abuf );
+            sprintf_s( abuf, "%.2f px", ad.projection_self_check_error );
+            kv( R_X + 14.f, ry, CW, "Projection error", abuf,
+                ad.projection_self_check_error < 1.f ? theme::text_faint() : theme::warn() );
+            // flight recorder: context of the most recent abnormal move
+            autobot::flight_record_t fr{};
+            if ( m_autobot.last_record( fr ) ) {
+                sprintf_s( abuf, "%s  (%.0f>%.0f)", fr.reason, fr.displacement, fr.bound );
+                kv( R_X + 14.f, ry, CW, "Last event", abuf, theme::warn() );
+                sprintf_s( abuf, "%s obj %d  #%llu", autobot::plan_type_name( fr.plan_type ),
+                    fr.object_index, static_cast<unsigned long long>( fr.plan_id ) );
+                kv( R_X + 14.f, ry, CW, "  plan / object", abuf );
+                sprintf_s( abuf, "t=%d  dt=%.1fms%s", fr.game_time, fr.dt * 1000.f,
+                    fr.external_reanchor ? "  reanchor" : "" );
+                kv( R_X + 14.f, ry, CW, "  when", abuf );
             }
             ry += 6.f;
 
-            if ( fold( R_X + 14.f, ry, CW, "MOVEMENT TELEMETRY" ) ) {
-                const char* movement_state = "Idle";
-                switch ( m_autobot.movement_state( ) ) {
-                case autobot::movement_state_t::acquire: movement_state = "Acquire"; break;
-                case autobot::movement_state_t::travel: movement_state = "Travel"; break;
-                case autobot::movement_state_t::arrival: movement_state = "Arrival"; break;
-                case autobot::movement_state_t::slider_entry: movement_state = "Slider entry"; break;
-                case autobot::movement_state_t::slider_follow: movement_state = "Slider follow"; break;
-                case autobot::movement_state_t::slider_exit: movement_state = "Slider exit"; break;
-                case autobot::movement_state_t::spinner_entry: movement_state = "Spinner entry"; break;
-                case autobot::movement_state_t::spinner_sustain: movement_state = "Spinner sustain"; break;
-                case autobot::movement_state_t::spinner_exit: movement_state = "Spinner exit"; break;
-                case autobot::movement_state_t::break_idle: movement_state = "Break idle"; break;
-                default: break;
-                }
-                const char* destination_owner = "NONE";
-                switch ( m_autobot.destination_owner( ) ) {
-                case autobot::destination_owner_t::gameplay: destination_owner = "GAMEPLAY"; break;
-                case autobot::destination_owner_t::slider: destination_owner = "SLIDER"; break;
-                case autobot::destination_owner_t::spinner: destination_owner = "SPINNER"; break;
-                case autobot::destination_owner_t::startup: destination_owner = "STARTUP"; break;
-                case autobot::destination_owner_t::break_idle: destination_owner = "BREAK_IDLE"; break;
-                case autobot::destination_owner_t::break_dance: destination_owner = "BREAK_DANCE"; break;
-                case autobot::destination_owner_t::recovery: destination_owner = "RECOVERY"; break;
-                default: break; }
-                const auto source_name = []( autobot::destination_source_t source ) { switch ( source ) {
-                    case autobot::destination_source_t::gameplay_trajectory: return "GAMEPLAY";
-                    case autobot::destination_source_t::slider_follow: return "SLIDER";
-                    case autobot::destination_source_t::spinner_orbit: return "SPINNER";
-                    case autobot::destination_source_t::startup_choreography: return "STARTUP";
-                    case autobot::destination_source_t::break_choreography: return "BREAK_DANCE";
-                    case autobot::destination_source_t::break_rest: return "BREAK_REST";
-                    case autobot::destination_source_t::recovery: return "RECOVERY";
-                    case autobot::destination_source_t::external_resync: return "RESYNC";
-                    default: return "NONE"; } };
-                const auto source_reason = []( autobot::source_change_reason_t reason ) { switch ( reason ) {
-                    case autobot::source_change_reason_t::target_change: return "TARGET_CHANGE";
-                    case autobot::source_change_reason_t::material_schedule_change: return "SCHEDULE_CHANGE";
-                    case autobot::source_change_reason_t::state_change: return "STATE_CHANGE";
-                    case autobot::source_change_reason_t::choreography_start: return "CHOREO_START";
-                    case autobot::source_change_reason_t::choreography_segment: return "CHOREO_SEGMENT";
-                    case autobot::source_change_reason_t::acquisition_deadline: return "ACQ_DEADLINE";
-                    case autobot::source_change_reason_t::recovery_required: return "RECOVERY";
-                    case autobot::source_change_reason_t::external_resync: return "RESYNC";
-                    case autobot::source_change_reason_t::invalid_trajectory: return "INVALID_TRAJ";
-                    default: return "NONE"; } };
-                const auto replan_reason = []( autobot::replan_reason_t reason ) { switch ( reason ) {
-                    case autobot::replan_reason_t::target_change: return "TARGET_CHANGE";
-                    case autobot::replan_reason_t::material_schedule_change: return "SCHEDULE_CHANGE";
-                    case autobot::replan_reason_t::state_change: return "STATE_CHANGE";
-                    case autobot::replan_reason_t::recovery_required: return "RECOVERY";
-                    case autobot::replan_reason_t::slider_change: return "SLIDER_CHANGE";
-                    case autobot::replan_reason_t::spinner_change: return "SPINNER_CHANGE";
-                    case autobot::replan_reason_t::invalid_trajectory: return "INVALID_TRAJ";
-                    case autobot::replan_reason_t::choreography_segment: return "CHOREO_SEGMENT";
-                    default: return "NONE"; } };
-
-                kv( R_X + 14.f, ry, CW, "Movement state", movement_state );
-                kv( R_X + 14.f, ry, CW, "Destination owner", destination_owner );
-                sprintf_s( abuf, "%s (prev %s)", source_name( ad.current_source ), source_name( ad.previous_source ) );
-                kv( R_X + 14.f, ry, CW, "Source", abuf );
-                kv( R_X + 14.f, ry, CW, "Source reason", source_reason( ad.source_change_reason ) );
-                sprintf_s( abuf, "%llu / %d", ad.trajectory_id, ad.source_object_index );
-                kv( R_X + 14.f, ry, CW, "Trajectory / object", abuf );
-                const bool clean = ad.gameplay_owner_violations == 0 && ad.unexpected_offroute_replans == 0 && ad.target_point_mutations == 0;
+            // ---- lifetime counters ----
+            if ( fold( R_X + 14.f, ry, CW, "PLAN COUNTERS" ) ) {
+                sprintf_s( abuf, "%llu", static_cast<unsigned long long>( ad.plans_created ) );
+                kv( R_X + 14.f, ry, CW, "Plans created", abuf );
                 sprintf_s( abuf, "%llu / %llu / %llu",
-                    ad.gameplay_owner_violations, ad.unexpected_offroute_replans, ad.target_point_mutations );
-                kv( R_X + 14.f, ry, CW, "Owner / off-route / mut.", abuf, clean ? theme::text_faint() : theme::bad() );
-                sprintf_s( abuf, "%s (%llu)", replan_reason( ad.last_replan_reason ), ad.movement_replans );
-                kv( R_X + 14.f, ry, CW, "Replan last / total", abuf );
-                sprintf_s( abuf, "%llu/%llu/%llu/%llu/%llu",
-                    ad.target_change_replans, ad.timing_update_replans, ad.slider_state_replans,
-                    ad.recovery_replans, ad.invalid_data_replans );
-                kv( R_X + 14.f, ry, CW, "Replans T/Tm/S/R/I", abuf );
-                sprintf_s( abuf, "%llu / %llu", ad.external_resync_events, ad.internal_trajectory_discontinuities );
-                kv( R_X + 14.f, ry, CW, "Resync / discontinuity", abuf,
-                    ( ad.external_resync_events || ad.internal_trajectory_discontinuities ) ? theme::warn() : theme::text_faint() );
-                sprintf_s( abuf, "%.1f, %.1f", ad.internal_desired_delta.x, ad.internal_desired_delta.y );
-                kv( R_X + 14.f, ry, CW, "Internal delta", abuf );
-                sprintf_s( abuf, "%.1f, %.1f", ad.final_requested_delta.x, ad.final_requested_delta.y );
-                kv( R_X + 14.f, ry, CW, "Final OS delta", abuf );
-                sprintf_s( abuf, "%.1f, %.1f", ad.observed_cursor_delta.x, ad.observed_cursor_delta.y );
-                kv( R_X + 14.f, ry, CW, "Observed delta", abuf );
-                sprintf_s( abuf, "%llu / %llu", ad.startup_primitives_generated, ad.break_primitives_generated );
-                kv( R_X + 14.f, ry, CW, "Startup / break prims", abuf );
-                sprintf_s( abuf, "%llu", ad.decorative_interruptions );
-                kv( R_X + 14.f, ry, CW, "Decorative interrupts", abuf, ad.decorative_interruptions ? 0 : theme::text_faint() );
+                    static_cast<unsigned long long>( ad.gameplay_plans ),
+                    static_cast<unsigned long long>( ad.slider_plans ),
+                    static_cast<unsigned long long>( ad.spinner_plans ) );
+                kv( R_X + 14.f, ry, CW, "Gameplay/Slider/Spin", abuf );
+                sprintf_s( abuf, "%llu / %llu / %llu",
+                    static_cast<unsigned long long>( ad.startup_segments ),
+                    static_cast<unsigned long long>( ad.break_segments ),
+                    static_cast<unsigned long long>( ad.recovery_plans ) );
+                kv( R_X + 14.f, ry, CW, "Startup/Break/Recover", abuf );
+                sprintf_s( abuf, "%llu / %llu",
+                    static_cast<unsigned long long>( ad.plan_invalidations ),
+                    static_cast<unsigned long long>( ad.external_reanchors ) );
+                kv( R_X + 14.f, ry, CW, "Invalidations/Reanchor", abuf );
+                sprintf_s( abuf, "%llu", static_cast<unsigned long long>( ad.objects_completed ) );
+                kv( R_X + 14.f, ry, CW, "Objects completed", abuf );
             }
 
             const float rbot = ry + 12.f;

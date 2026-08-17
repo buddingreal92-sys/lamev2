@@ -63,6 +63,7 @@ namespace ui {
     private:
         HWND m_hwnd = nullptr;
         bool m_visible = true;
+        bool m_exit_requested = false;   // X button -> normal shutdown via pump()
         bool m_menu_key_was_down = false;
         snapshot_fn m_snapshot_fn;
         threads::c_cache* m_cache = nullptr;

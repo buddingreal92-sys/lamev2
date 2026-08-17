@@ -2,48 +2,53 @@
 
 ## Resolved
 
-- **Target Accuracy had little effect on real maps.** The old probability controller
-  used a feed-forward of `(100 - target)·0.015` that assumed every object was a circle
-  and a weak clamped feedback term. On maps with sliders/spinners (guaranteed 300s) it
-  systematically converged **above** target (offline: 95% target → 96.9%, 98.5% → 99.0%
-  on a 45%-slider map). Replaced with a debt-based integral controller that accounts for
-  object-type dilution exactly and only spends controlled 100s on isolated circles.
-  Offline convergence now within 0.08% of target across pure-circle → 65%-slider maps.
-  (`core/relax/relax.hxx`)
+- **Autobot occasional mystery movement (travels to an unrelated location, then
+  resumes).** The old controller carried several overlapping state machines
+  (`movement_state` × `destination_owner` × `destination_source` × replan reasons)
+  plus a decorative choreography system that picked a **random staging point far from
+  the object** and drove the cursor there whenever a gap exceeded a threshold. Any
+  miscoordination between those machines — a stale primed trajectory, a decorative
+  owner briefly winning, a far staging point during an ordinary slow section — read as
+  a jump to nowhere. Rewritten around **one MotionState + one MovementPlan + one output
+  path** (`core/autobot/motion_core.hxx` + `autobot.hxx`):
+  - exactly one plan owns movement each frame; plans are only rebuilt on a real
+    identity change (never per frame), always from the current MotionState;
+  - decorative motion is **local and bounded** (short hops around the cursor's current
+    position), so it can never be a far destination and can never own the cursor while
+    gameplay acquisition is required;
+  - continuity is enforced by a kinematic budget and any violation is recorded in a
+    flight recorder (`diagnostics.unexpected_discontinuities`, expected 0).
+  Verified off-line across 16 deterministic scenarios (`tests/motion_tests.cpp`, 81
+  checks): finite positions, zero discontinuities, bounded per-frame displacement,
+  correct plan transitions, and decorative never owning during acquisition. **Live
+  osu! confirmation still pending** (osu! not available in this environment).
 
-- **Autobot jump on slider/spinner/choreography exit.** When motion returned to the
-  gameplay quintic after a frame driven by the slider follower, spinner orbit, or
-  decorative choreography, a quintic left over from priming still held a stale start
-  point/time, so the first gameplay frame evaluated it away from the current cursor.
-  Fixed with an owner-transition re-anchor that replans from the actual current state
-  (`diagnostics.owner_transition_replans`).
+- **Slider / spinner entry snap.** The old follower set `desired ≈ ball` and the
+  spinner snapped to the orbit radius on the first active frame, producing a
+  one-frame snap proportional to the approach error. Now the slider follower blends an
+  `entry_offset` to zero (first follow frame == incoming position) and the spinner
+  integrator starts from the actual incoming radius/angle with the ellipse blended in
+  by the entry factor. Off-line: zero discontinuities on circle→slider, slider→circle,
+  circle→spinner, spinner→circle.
 
-- **Decorative wandering during ordinary slow sections.** The break-motion gate treated
-  any gap `> 1800 ms` as a break and let the cursor wander to a decorative staging point
-  mid-map. Raised to `> 2600 ms` with a larger return-budget margin so only genuine
-  breaks trigger decorative motion.
+- **Target Accuracy had little effect on real maps.** (Unchanged in this rewrite —
+  the debt-based controller in `core/relax/relax.hxx` is preserved.) The old
+  probability controller assumed all-circles and overshot toward 100% on slider maps;
+  the debt-based integral controller accounts for object-type dilution exactly and
+  spends controlled 100s only on isolated circles. Offline convergence within 0.08% of
+  target across pure-circle → 65%-slider maps.
 
-## Monitoring (instrumented, not yet reproduced live)
+## Monitoring (instrumented, needs live confirmation)
 
-- **Residual random jumps during active gameplay.** Could not be reproduced offline
-  (osu! not available in this environment). A bounded bad-delta trace buffer now captures
-  the full provenance (owner, previous owner, source, object index, dt, displacement vs.
-  kinematic bound, resync state) of any motion sample that exceeds its kinematic bound,
-  surfaced in the Autobot diagnostics panel (`Off-trajectory events` / `Last jump`).
-  When a live jump occurs, read that panel: it attributes the jump to a category
-  (owner transition, external resync, dt spike, slider/spinner entry snap, or gameplay
-  trajectory) so the exact remaining cause can be fixed with certainty.
-
-- **Slider/spinner entry snap (candidate, not yet changed).** `update_slider` sets
-  `desired ≈ ball` and `update_spinner` snaps to the orbit radius on the first active
-  frame; if the approach left the cursor far from the head/center this produces a
-  one-frame snap proportional to the approach error. Left unchanged pending confirmation
-  from the trace buffer, because the slider/spinner follow + tail path is approval-gated
-  and a well-timed approach keeps the snap sub-pixel. If the trace attributes live jumps
-  to `SLIDER`/`SPINNER` entry, smooth the first N ms of the follow.
+- **Live movement confirmation.** The rewrite proves the movement invariants off-line
+  but osu! is not available here. When testing live, watch the Autobot diagnostics
+  panel: `Discontinuities` must stay 0, and the flight recorder's `Last event`
+  attributes any abnormal move to its exact plan (type, object, displacement vs.
+  bound, dt, reanchor). If a live jump appears, that line names the responsible plan.
 
 - **Transient playfield-rect reads.** `get_playfield_rect` can momentarily return an
-  inconsistent rect during window state changes (alt-tab, resolution/fullscreen toggle),
-  which would map a continuous internal position to a different screen point for one
-  frame. Environmental; the trace buffer's `dt` / owner fields help distinguish this from
-  an internal cause.
+  inconsistent rect during window state changes (alt-tab, resolution/fullscreen
+  toggle). The adapter now holds the frame (no emit) when a screen delta dwarfs the
+  playfield delta, and records a `geometry` flight event; the engine's motion stays
+  continuous regardless because it works purely in playfield space. Environmental —
+  confirm the guard behaves on a real fullscreen toggle.

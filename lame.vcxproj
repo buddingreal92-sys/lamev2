@@ -103,6 +103,7 @@
     <ClInclude Include="core\aim_assist\aimbot.hxx" />
     <ClInclude Include="core\aim_assist\a_core.hxx" />
     <ClInclude Include="core\autobot\autobot.hxx" />
+    <ClInclude Include="core\autobot\motion_core.hxx" />
     <ClInclude Include="core\beatmap\i_beatmap_provider.hxx" />
     <ClInclude Include="core\beatmap\lazer_index.hxx" />
     <ClInclude Include="core\beatmap\lazer_memory.hxx" />

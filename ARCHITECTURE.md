@@ -44,82 +44,126 @@ controller exists — every accuracy-mode branch is guarded by
 
 ---
 
-## Autobot movement model (`core/autobot/autobot.hxx`)
+## Autobot movement model
 
-The cursor is **one continuous state** (`m_motion.position/velocity/acceleration`).
-**It never teleports.** Every destination is reached through a committed,
-time-based **quintic trajectory** (`ensure_object_trajectory` / `evaluate_trajectory`)
-whose `t=0` derivatives equal the current motion state, or through the slider
-follower / spinner orbit / decorative segment evaluators.
+**ONE MotionState. ONE MovementPlan. ONE output path.**
 
-### Destination ownership (priority high -> low)
+The engine is split so the whole planner + evaluator can be unit-tested off-line:
 
-`m_destination_owner` (`slider`/`spinner` > `gameplay` > `recovery` > `startup` >
-`break_dance`/`break_idle`). Decided each frame in `update()`:
+- **`core/autobot/motion_core.hxx`** — the pure, host-independent engine
+  (`motion_engine_t`). No Windows / Relax / projection. All movement math lives
+  here: MotionState, MovementPlan, the quintic evaluator, slider geometry +
+  follower, spinner integrator, the planner, the commit/continuity check, and the
+  flight recorder. Everything happens in osu! playfield coordinates.
+- **`core/autobot/autobot.hxx`** — the thin Windows adapter (`c_autobot`). It reads
+  the OS cursor and projects it to playfield space, turns the shared Relax
+  scheduler into a `schedule_view_t`, drives `motion_engine_t::update()` once per
+  frame, projects the engine's single position back to the screen and emits it, and
+  owns the two screen-space safeguards the pure engine cannot see (persistent
+  external-cursor mismatch, one anomalous playfield rect).
 
-1. `find_active_long_object()` — if a slider/spinner is currently active, it owns
-   (`update_slider` / `update_spinner`). Decorative motion is stopped.
-2. Otherwise the next object (`m_last_completed_index + 1`) is the gameplay target.
-   Decorative choreography is allowed **only** for startup (before the first note)
-   or a **genuine break** (gap `> 2600 ms`) *and* only while the return-time budget
-   proves the cursor can get back in time (`time_left > return_time + 520 ms`).
-   `gameplay_must_own = !choreography_allowed`; if a decorative owner is ever set
-   while `gameplay_must_own`, `diagnostics.gameplay_owner_violations` fires.
+Mental model, evaluated once per frame:
+
+```
+current MotionState + current MovementPlan + current time  ->  next cursor position
+```
+
+**No teleporting.** The only direct position assignment is seeding the MotionState
+from the observed cursor at session start / re-anchor. After that every position
+evolves continuously.
+
+### The one plan (`plan_t`, `plan_type_t`)
+
+Exactly one plan owns the cursor: `gameplay`, `recovery`, `slider`, `spinner`,
+`startup`, or `break_decor`. A trajectory plan (gameplay / recovery / decorative
+segment) is a timed **quintic Hermite** curve from the captured `(p0,v0,a0)` to
+`(p1,v1,0)`. Slider-follow and spinner plans are evaluated procedurally against
+geometry but carry their captured entry state so the transition in is continuous.
+
+Trajectory model = **C2-continuous quintic (minimum-jerk-style) with a fixed timed
+arrival**, chosen for: position+velocity+acceleration continuity across replans (no
+kink when a new plan starts mid-flight), exact arrival at the scheduled press
+timestamp, closed-form (numerically trivial) evaluation, and stable replanning
+because every new segment reads the current `(p,v,a)`.
+
+### The planner (`plan_and_reconcile`)
+
+Each frame picks the single authoritative plan:
+
+1. `find_active_long()` — a slider/spinner inside `[press, end]` owns (`slider` /
+   `spinner`).
+2. else the next object (`last_completed + 1`) is the target. If we are late
+   (`time_left <= 0`) → `recovery` toward the **same** object. Otherwise decorative
+   motion is allowed **only** when the return-time budget proves the object is still
+   reachable (`time_left > acquisition_lead + safety + slack`); then `startup`
+   (before the first note) or `break_decor`. Otherwise `gameplay`.
+3. no objects left → local `break_decor` idle.
+
+A plan is created **only** on an identity change (type, object index, or a scheduled
+arrival that moved > 12 ms) — never per frame, so there are no replan loops or stale
+reuse. Every new plan begins from the **actual current MotionState**.
+
+**Decorative motion is local and bounded.** Startup/break segments are short quintic
+hops around an anchor set to the cursor's *current* position, with damped inherited
+velocity. There is no far-away staging point, so decorative motion can never read as
+a jump to an unrelated location, and the return to gameplay is an ordinary continuous
+plan from wherever the cursor is. Because the planner re-evaluates the return budget
+every frame, decorative motion yields to gameplay acquisition automatically — a
+decorative plan can never own the cursor while acquisition is required.
 
 ### Immutable target points
 
-`target_point(index)` selects one interior point per object and caches it in a
-write-once shadow (`m_hit_point_shadow`). The returned value always comes from the
-shadow; any divergence increments `target_point_mutations` (expected 0). Points do
-not regenerate on replan, timing refresh, lookahead, UI frame, or state change.
+`target_point(index)` selects one interior point per object (spinners get an orbit-
+entry point at radius ~70) and caches it write-once. It never regenerates on replan,
+schedule refresh, lookahead, or UI frame.
 
-### Replan invariants
+### Sliders / spinners (continuous entry, no snap)
 
-Every replan starts from the **actual current** position/velocity/acceleration:
-`ensure_object_trajectory` sets `p0 = m_motion.position`, `v0 = m_motion.velocity`,
-`a0 = m_motion.acceleration`. A trajectory is only rebuilt when the target index or
-the immutable scheduled arrival time changes. The scheduled arrival (not a transient
-recovery deadline) is the trajectory identity key, so late recovery does not replan
-every frame.
+- **Slider:** on entry the plan captures `entry_offset = position - ball`; each frame
+  `desired = ball(t) + entry_offset·e^(-age/45ms)`, so the first follow frame equals
+  the incoming position (offset = full) and converges onto the ball. Slider Laziness
+  keeps it loose. Exit is a normal gameplay plan from the slider-exit MotionState.
+- **Spinner:** the integrator starts from the actual incoming angle / radius /
+  direction (no snap to centre or to full RPM); the cosmetic ellipse blends in by the
+  entry factor and the radius ramps via a spring, so the first orbit frame matches the
+  incoming point. RPM is a ramped target.
 
-**Owner-transition re-anchor** (fixes the stale primed-trajectory jump): a
-slider/spinner/choreography frame drives the cursor by means other than the gameplay
-quintic, so a quintic left over from priming holds a stale `p0`/start time. On the
-first gameplay frame after such an owner, the trajectory is invalidated and replanned
-from the current state (`diagnostics.owner_transition_replans`).
+### Continuity budget / flight recorder
 
-### External cursor resync (`sync_external_cursor`)
+`commit_motion` writes the MotionState and checks every step against a kinematic
+budget (`max(|v|)·dt + ½·max(|a|)·dt² + slack`). A produced position is always
+finite and (by construction) within budget; any violation increments
+`unexpected_discontinuities` (**expected 0**) and is captured in a bounded 24-entry
+**flight recorder** with the exact plan id/type, object, dt, displacement vs. bound,
+and reason — so a live jump can be attributed to its plan after the fact.
 
-The autobot emits absolute cursor positions and remembers the last one. A single
-stale/delayed `GetCursorPos` sample must not tear down a valid trajectory:
-resync requires the observed cursor to differ from the last emitted point by
-**> 6 px for 3 consecutive frames**; only then does it rebase position and inherit a
-bounded observed velocity/acceleration (continuity preserved, no teleport).
+### External cursor feedback (adapter)
 
-### dt / clock
+The adapter emits absolute positions and remembers the last one. A single
+stale/delayed `GetCursorPos` sample must not tear down a plan: re-anchor requires the
+observed cursor to differ from the last emitted point by **> 6 px for 3 consecutive
+frames**; only then does `engine.reanchor()` rebase on the observed state and let the
+next plan start from there (`diagnostics.external_reanchors`).
 
-`real_dt` (steady_clock) is clamped to `[0.001, 0.025] s` for all motion math, so a
-frame hitch or tab-out cannot snap a trajectory. `control_time =
-max(game.cur_time, floor(relax.prepared_game_time()))`; `prepared_game_time` is
-`cur_time + wall_elapsed*speed` capped at +30 ms. A backward jump of `> 200 ms`
-(map rewind/retry) starts a new session.
+### dt / clock / geometry
 
-### Coordinates
+`real_dt` (steady_clock) is clamped to `[0.001, 0.025] s`; a hitch or tab-out cannot
+snap. `control_time = max(game.cur_time, floor(relax.prepared_game_time()))` drives
+quintic progress, so arrival lands on the scheduled press game-time. A backward jump
+of `> 200 ms` (retry/rewind) starts a new session. One projection helper
+(`impl/util/playfield.hxx`); `verify_projection()` still cross-checks it into
+`diagnostics.projection_self_check_error`. The adapter holds the frame (no emit) if a
+single anomalous playfield rect would turn a small internal move into a huge screen
+jump.
 
-One projection helper (`impl/util/playfield.hxx`). `playfield_to_screen` (emit) and
-`screen_to_playfield` (observe) are exact inverses (0.8·height playfield, 4:3, +17 px
-y-offset). `verify_projection()` cross-checks canonical vs. `project_osu_to_window`
-at (0,0)/(256,192)/(512,384) into `diagnostics.projection_self_check_error`. Do not
-duplicate projection math (a duplicate once put Aim Assist ~29.96 px too high).
+### Diagnostics
 
-### Diagnostics / instrumentation
-
-`diagnostics_t` tracks provenance (current/previous source, source-change reason,
-replan reason, trajectory id, object index) and health counters (owner violations,
-off-route replans, target-point mutations, internal discontinuities). A bounded
-**bad-delta ring buffer** (`k_trace_capacity = 24`) captures full context whenever a
-motion sample exceeds its kinematic bound; `last_bad_delta()` / `bad_delta_count()`
-surface it in the UI so a live random-jump can be attributed after the fact.
+`diagnostics_t` describes the architecture directly: live plan type/id, object index,
+progress, time-to-arrival, MotionState position/velocity/acceleration, target and
+requested/observed cursor; plus counters (plans created, gameplay/slider/spinner
+plans, startup/break segments, recovery plans, plan invalidations, external
+reanchors, unexpected discontinuities, objects completed). Surfaced in the Autobot
+diagnostics panel.
 
 ---
 
