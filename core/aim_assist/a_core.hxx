@@ -18,6 +18,12 @@ namespace assist {
         int32_t game_time = 0;
         bool    alive = false;
         bool    is_slider = false;
+        float   slider_geometry_demand = 0.f;
+        float   slider_excursion_radii = 0.f;
+        float   slider_duration_ms = 0.f;
+        int32_t slider_repeat = 1;
+        bool    slider_compact = false;
+        bool    slider_compact_repeat = false;
     };
 
     struct config {
@@ -46,6 +52,7 @@ namespace assist {
         rejected_distance,
         rejected_direction,
         rejected_timing,
+        rejected_slider_low_demand,
         corrected
     };
 
@@ -81,6 +88,18 @@ namespace assist {
         float final_correction_miss = 0.f;
         float safe_destination_multiplier = 0.f;
         float closest_predicted_miss = 0.f;
+        bool target_is_slider = false;
+        bool slider_target_new = false;
+        bool slider_assist_activation = false;
+        bool slider_rejected_safe = false;
+        bool slider_rejected_low_demand = false;
+        bool slider_compact_suppressed = false;
+        float slider_assist_demand = 0.f;
+        float slider_geometry_demand = 0.f;
+        float slider_entry_difficulty = 0.f;
+        float slider_demand_state = 0.f;
+        int32_t slider_demand_bind_id = 0;
+        int32_t slider_activation_bind_id = 0;
         gate_result last_gate_result = gate_result::none;
         float target_switch_damping_remaining = 0.f;
         vec2 target_switch_direction{};
@@ -97,6 +116,76 @@ namespace assist {
             return x >= edge1 ? 1.f : 0.f;
         const float t = saturate( ( x - edge0 ) / ( edge1 - edge0 ) );
         return t * t * ( 3.f - 2.f * t );
+    }
+
+    struct slider_demand_result_t {
+        float demand = 1.f;
+        float entry_difficulty = 0.f;
+        float predicted_miss_demand = 0.f;
+        bool already_safe = false;
+        bool low_demand = false;
+        bool compact_suppressed = false;
+    };
+
+    // Pure, normalized decision helper used by the live controller and offline tests.
+    // Geometry can permit assistance, but only predicted miss evidence creates demand.
+    inline slider_demand_result_t compute_slider_assist_demand(
+        const waypoint_t& target,
+        float current_distance,
+        float predicted_distance,
+        float zero_inner_radius,
+        float accepted_safe_radius,
+        float hit_radius,
+        float eta_ms,
+        float speed_mult = 1.f ) {
+
+        slider_demand_result_t result{};
+        if ( !target.is_slider )
+            return result;
+
+        result.demand = 0.f;
+        const float radius = std::max( hit_radius, 1.f );
+        if ( predicted_distance <= zero_inner_radius ) {
+            result.already_safe = true;
+            result.low_demand = true;
+            return result;
+        }
+
+        const float distance_radii = current_distance / radius;
+        const float real_eta_ms = eta_ms / std::max( speed_mult, 0.25f );
+        const float seconds_remaining = std::max( real_eta_ms, 25.f ) * 0.001f;
+        const float remaining_radii = std::max(
+            current_distance - accepted_safe_radius, 0.f ) / radius;
+        const float required_radii_per_second = remaining_radii / seconds_remaining;
+        const float distance_difficulty = smoothstep( 1.35f, 4.20f, distance_radii );
+        const float speed_difficulty = smoothstep(
+            4.50f, 13.0f, required_radii_per_second );
+        result.entry_difficulty = saturate(
+            0.42f * distance_difficulty + 0.58f * speed_difficulty );
+
+        const float full_miss_radius = std::max(
+            accepted_safe_radius, radius * 1.18f );
+        result.predicted_miss_demand = smoothstep(
+            zero_inner_radius, full_miss_radius, predicted_distance );
+        const float strong_miss = smoothstep(
+            radius * 1.00f, radius * 1.65f, predicted_distance );
+        const float geometry = saturate( target.slider_geometry_demand );
+        float need = geometry + ( 1.f - geometry ) * result.entry_difficulty;
+
+        // A clear miss can still rescue an otherwise easy slider; geometry suppression
+        // must not turn compact sliders into an unconditional ignore rule.
+        need = std::max( need, 0.85f * strong_miss );
+        float compact_scale = 1.f;
+        if ( target.slider_compact ) {
+            compact_scale = 0.35f + 0.65f * std::max(
+                result.entry_difficulty, strong_miss );
+            result.compact_suppressed = compact_scale < 0.90f;
+        }
+
+        result.demand = saturate(
+            result.predicted_miss_demand * need * compact_scale );
+        result.low_demand = result.demand < 0.06f;
+        return result;
     }
 
     inline vec2 operator+( vec2 a, vec2 b ) { return { a.x + b.x, a.y + b.y }; }
@@ -186,6 +275,15 @@ namespace assist {
         mem.high_difficulty_rescue_activation = false;
         mem.large_jump_rescue_activation = false;
         mem.final_correction_sample = false;
+        mem.target_is_slider = false;
+        mem.slider_target_new = false;
+        mem.slider_assist_activation = false;
+        mem.slider_rejected_safe = false;
+        mem.slider_rejected_low_demand = false;
+        mem.slider_compact_suppressed = false;
+        mem.slider_assist_demand = 0.f;
+        mem.slider_geometry_demand = 0.f;
+        mem.slider_entry_difficulty = 0.f;
         mem.last_gate_result = gate_result::none;
         if ( !mem.has_raw ) {
             mem.raw_pos = raw;
@@ -231,7 +329,10 @@ namespace assist {
 
         if ( target ) {
             mem.has_target = true;
+            const bool target_new = mem.bind_id != target->start_time;
             const bool target_changed = mem.bind_id != 0 && mem.bind_id != target->start_time;
+            mem.target_is_slider = target->is_slider;
+            mem.slider_target_new = target->is_slider && target_new;
             if ( target_changed && mem.has_last_corrected_miss ) {
                 mem.final_correction_sample = true;
                 mem.final_correction_miss = mem.last_corrected_miss;
@@ -378,6 +479,40 @@ namespace assist {
             mem.relevant_approach = current_distance <= outer_radius
                 && timing_gate > 0.05f && direction_gate > 0.05f;
 
+            float slider_demand_gate = 1.f;
+            if ( target->is_slider ) {
+                const slider_demand_result_t slider_demand = compute_slider_assist_demand(
+                    *target, current_distance, predicted_distance, zero_inner_radius,
+                    accepted_safe_radius, hit_radius, eta, params.speed_mult );
+
+                if ( mem.slider_demand_bind_id != target->start_time )
+                    mem.slider_demand_bind_id = target->start_time;
+
+                const float demand_response = slider_demand.demand > mem.slider_demand_state
+                    ? 0.045f : 0.075f;
+                const float demand_alpha = 1.f - std::exp(
+                    -dt / demand_response );
+                mem.slider_demand_state +=
+                    ( slider_demand.demand - mem.slider_demand_state ) * demand_alpha;
+                mem.slider_demand_state = saturate( mem.slider_demand_state );
+
+                slider_demand_gate = mem.slider_demand_state;
+                mem.slider_assist_demand = slider_demand_gate;
+                mem.slider_geometry_demand = saturate(
+                    target->slider_geometry_demand );
+                mem.slider_entry_difficulty = slider_demand.entry_difficulty;
+                mem.slider_rejected_safe = slider_demand.already_safe;
+                mem.slider_rejected_low_demand = slider_demand.low_demand;
+                mem.slider_compact_suppressed =
+                    target->slider_compact && slider_demand.compact_suppressed;
+            }
+            else {
+                mem.slider_demand_bind_id = 0;
+                const float demand_alpha = 1.f - std::exp( -dt / 0.075f );
+                mem.slider_demand_state +=
+                    ( 0.f - mem.slider_demand_state ) * demand_alpha;
+            }
+
             const float needed_distance = std::max(
                 predicted_distance - safe_destination_radius, 0.f );
             mem.rescue_demand = saturate(
@@ -395,7 +530,7 @@ namespace assist {
             const float prediction_gate = 1.f - speculative_reduction * speculative_miss *
                 ( 1.f - mem.prediction_confidence );
             const float envelope = outer_gate * inner_gate * timing_gate *
-                direction_gate * prediction_gate;
+                direction_gate * prediction_gate * slider_demand_gate;
             const float correction_gain = strength * envelope;
             if ( length_sq( minimum_path_translation ) >
                  max_displacement * max_displacement &&
@@ -408,6 +543,11 @@ namespace assist {
             mem.requested_correction_magnitude = length( desired_offset );
             mem.requested_correction = mem.requested_correction_magnitude > 0.05f;
             if ( mem.requested_correction ) {
+                if ( target->is_slider &&
+                     mem.slider_activation_bind_id != target->start_time ) {
+                    mem.slider_activation_bind_id = target->start_time;
+                    mem.slider_assist_activation = true;
+                }
                 mem.has_last_corrected_miss = true;
                 mem.last_corrected_miss = predicted_distance;
                 if ( params.adaptive_boost > 0.01f &&
@@ -433,6 +573,9 @@ namespace assist {
                 mem.last_gate_result = gate_result::rejected_direction;
             else if ( predicted_distance <= zero_inner_radius || inner_gate <= 0.001f )
                 mem.last_gate_result = gate_result::rejected_safe_trajectory;
+            else if ( target->is_slider &&
+                      ( mem.slider_rejected_low_demand || slider_demand_gate <= 0.01f ) )
+                mem.last_gate_result = gate_result::rejected_slider_low_demand;
             else if ( mem.requested_correction )
                 mem.last_gate_result = gate_result::corrected;
             else {
@@ -463,6 +606,10 @@ namespace assist {
                 mem.has_last_corrected_miss = false;
             }
             mem.bind_id = 0;
+            mem.slider_demand_bind_id = 0;
+            const float demand_alpha = 1.f - std::exp( -dt / 0.075f );
+            mem.slider_demand_state +=
+                ( 0.f - mem.slider_demand_state ) * demand_alpha;
         }
 
         // Critically damped offset control. Limits are derived from the resolution-scaled

@@ -135,15 +135,22 @@ namespace beatmap {
             memory::c_process& process,
             uint64_t list,
             const offsets::lazer::table_t& off,
-            resolved_chain_t& out ) {
+            resolved_chain_t& out,
+            int* progress = nullptr ) {
 
             if ( !plausible_managed_object( process, list ) )
                 return false;
+
+            if ( progress )
+                *progress = (std::max)( *progress, 4 );
 
             const auto items = process.read<uint64_t>( list + off.list_items );
             const auto count = process.read<int32_t>( list + off.list_size );
             if ( !plausible_managed_object( process, items ) || count <= 0 || count > 100000 )
                 return false;
+
+            if ( progress )
+                *progress = (std::max)( *progress, 5 );
 
             uint32_t start_field = off.hit_object_start_time_bindable;
             uint32_t value_field = off.bindable_number_value;
@@ -169,6 +176,9 @@ namespace beatmap {
             if ( !exact_ok && !resolve_start_layout( process, items, count, off, start_field, value_field ) )
                 return false;
 
+            if ( progress )
+                *progress = (std::max)( *progress, 6 );
+
             out.hit_list = list;
             out.items = items;
             out.count = count;
@@ -184,18 +194,25 @@ namespace beatmap {
             uint32_t beatmap_field,
             uint32_t hitobjects_field,
             const offsets::lazer::table_t& off,
-            resolved_chain_t& out ) {
+            resolved_chain_t& out,
+            int* progress = nullptr ) {
 
             if ( !plausible_managed_object( process, drawable ) )
                 return false;
+
+            if ( progress )
+                *progress = (std::max)( *progress, 2 );
 
             const auto beatmap = process.read<uint64_t>( drawable + beatmap_field );
             if ( !plausible_managed_object( process, beatmap ) )
                 return false;
 
+            if ( progress )
+                *progress = (std::max)( *progress, 3 );
+
             const auto hit_list = process.read<uint64_t>( beatmap + hitobjects_field );
             resolved_chain_t candidate{};
-            if ( !validate_hit_list( process, hit_list, off, candidate ) )
+            if ( !validate_hit_list( process, hit_list, off, candidate, progress ) )
                 return false;
 
             candidate.drawable = drawable;
@@ -212,7 +229,8 @@ namespace beatmap {
             memory::c_process& process,
             const osu::game_snapshot_t& game,
             const offsets::lazer::table_t& off,
-            resolved_chain_t& out ) {
+            resolved_chain_t& out,
+            int* progress_out = nullptr ) {
 
             // Cache a successful resolution for this Player object. If resolution fails,
             // throttle retries so a bad offset cannot peg a CPU core.
@@ -220,27 +238,36 @@ namespace beatmap {
             static uint64_t cached_player = 0;
             static resolved_chain_t cached{};
             static ULONGLONG last_attempt = 0;
+            static int cached_progress = 0;
 
             const ULONGLONG now = GetTickCount64( );
             const bool same_player = cached_pid == process.pid( ) && cached_player == game.player_screen;
 
+            int progress = plausible_managed_object( process, game.player_screen ) ? 1 : 0;
+
             if ( same_player && cached.valid ) {
                 resolved_chain_t revalidated{};
                 if ( try_chain( process, cached.drawable, cached.player_drawable_field,
-                        cached.drawable_beatmap_field, cached.beatmap_hitobjects_field, off, revalidated ) ) {
+                        cached.drawable_beatmap_field, cached.beatmap_hitobjects_field, off, revalidated, &progress ) ) {
                     out = revalidated;
+                    if ( progress_out )
+                        *progress_out = progress;
                     return true;
                 }
                 cached = {};
             }
 
-            if ( same_player && now - last_attempt < 750 )
+            if ( same_player && now - last_attempt < 750 ) {
+                if ( progress_out )
+                    *progress_out = (std::max)( progress, cached_progress );
                 return false;
+            }
 
             cached_pid = process.pid( );
             cached_player = game.player_screen;
             last_attempt = now;
             cached = {};
+            cached_progress = progress;
 
             const auto beatmap_fields = nearby_offsets( off.drawable_osu_beatmap, 0x80 );
             const auto hitlist_fields = nearby_offsets( off.beatmap_hit_objects, 0x20 );
@@ -250,8 +277,11 @@ namespace beatmap {
                 for ( const auto beatmap_field : beatmap_fields ) {
                     for ( const auto hitlist_field : hitlist_fields ) {
                         if ( try_chain( process, game.drawable_ruleset, off.player_drawable_ruleset,
-                                beatmap_field, hitlist_field, off, out ) ) {
+                                beatmap_field, hitlist_field, off, out, &progress ) ) {
                             cached = out;
+                            cached_progress = progress;
+                            if ( progress_out )
+                                *progress_out = progress;
                             dbg::log( "lazer chain resolved: player_drawable=0x%X drawable_beatmap=0x%X beatmap_hitobjects=0x%X start_bindable=0x%X bindable_value=0x%X count=%d",
                                 out.player_drawable_field, out.drawable_beatmap_field,
                                 out.beatmap_hitobjects_field, out.start_bindable_field, out.bindable_number_field, out.count );
@@ -272,8 +302,11 @@ namespace beatmap {
 
                     // Fast path: exact downstream fields.
                     if ( try_chain( process, drawable, player_field,
-                            off.drawable_osu_beatmap, off.beatmap_hit_objects, off, out ) ) {
+                            off.drawable_osu_beatmap, off.beatmap_hit_objects, off, out, &progress ) ) {
                         cached = out;
+                        cached_progress = progress;
+                        if ( progress_out )
+                            *progress_out = progress;
                         dbg::log( "lazer chain resolved: player_drawable=0x%X drawable_beatmap=0x%X beatmap_hitobjects=0x%X start_bindable=0x%X bindable_value=0x%X count=%d",
                             out.player_drawable_field, out.drawable_beatmap_field,
                             out.beatmap_hitobjects_field, out.start_bindable_field, out.bindable_number_field, out.count );
@@ -283,8 +316,11 @@ namespace beatmap {
                     for ( const auto beatmap_field : beatmap_fields ) {
                         for ( const auto hitlist_field : hitlist_fields ) {
                             if ( try_chain( process, drawable, player_field,
-                                    beatmap_field, hitlist_field, off, out ) ) {
+                                    beatmap_field, hitlist_field, off, out, &progress ) ) {
                                 cached = out;
+                                cached_progress = progress;
+                                if ( progress_out )
+                                    *progress_out = progress;
                                 dbg::log( "lazer chain resolved: player_drawable=0x%X drawable_beatmap=0x%X beatmap_hitobjects=0x%X start_bindable=0x%X bindable_value=0x%X count=%d",
                                     out.player_drawable_field, out.drawable_beatmap_field,
                                     out.beatmap_hitobjects_field, out.start_bindable_field, out.bindable_number_field, out.count );
@@ -295,10 +331,111 @@ namespace beatmap {
                 }
             }
 
+            cached_progress = progress;
+            if ( progress_out )
+                *progress_out = progress;
             return false;
         }
 
+        static const char* failure_stage_name( int progress ) {
+            switch ( progress ) {
+            case 0: return "player screen is not a valid managed object";
+            case 1: return "DrawableRuleset field unresolved";
+            case 2: return "drawable beatmap field unresolved";
+            case 3: return "hit-object collection field unresolved";
+            case 4: return "hit-object list items/count invalid";
+            case 5: return "hit-object start-time bindable/value unresolved";
+            default: return "unknown chain validation failure";
+            }
+        }
+
+        static void log_chain_failure_details(
+            memory::c_process& process,
+            const osu::game_snapshot_t& game,
+            const offsets::lazer::table_t& off,
+            const char* stage ) {
+
+            static int32_t last_pid = 0;
+            static uint64_t last_player = 0;
+            static ULONGLONG last_log = 0;
+            const ULONGLONG now = GetTickCount64( );
+            if ( last_pid == process.pid( ) && last_player == game.player_screen &&
+                 now - last_log < 3000 )
+                return;
+
+            last_pid = process.pid( );
+            last_player = game.player_screen;
+            last_log = now;
+
+            const uint64_t drawable = game.drawable_ruleset;
+            const uint64_t beatmap = plausible_managed_object( process, drawable )
+                ? process.read<uint64_t>( drawable + off.drawable_osu_beatmap ) : 0;
+            const uint64_t hit_list = plausible_managed_object( process, beatmap )
+                ? process.read<uint64_t>( beatmap + off.beatmap_hit_objects ) : 0;
+            const uint64_t items = plausible_managed_object( process, hit_list )
+                ? process.read<uint64_t>( hit_list + off.list_items ) : 0;
+            const int32_t count = plausible_managed_object( process, hit_list )
+                ? process.read<int32_t>( hit_list + off.list_size ) : 0;
+            const uint64_t first_object = plausible_managed_object( process, items ) && count > 0
+                ? process.read<uint64_t>( items + off.array_first_element ) : 0;
+            const uint64_t start_bindable = plausible_managed_object( process, first_object )
+                ? process.read<uint64_t>( first_object + off.hit_object_start_time_bindable ) : 0;
+            const double start_value = plausible_managed_object( process, start_bindable )
+                ? process.read<double>( start_bindable + off.bindable_number_value ) : 0.0;
+            const float position_x = plausible_managed_object( process, first_object )
+                ? process.read<float>( first_object + off.osu_hit_object_position_xy ) : 0.f;
+            const float position_y = plausible_managed_object( process, first_object )
+                ? process.read<float>( first_object + off.osu_hit_object_position_xy + 4 ) : 0.f;
+            const uint64_t nested = plausible_managed_object( process, first_object )
+                ? process.read<uint64_t>( first_object + off.hit_object_nested_objects ) : 0;
+            const int32_t nested_count = plausible_managed_object( process, nested )
+                ? process.read<int32_t>( nested + off.list_size ) : 0;
+
+            dbg::log(
+                "lazer chain failed: stage='%s' player=0x%llX drawable=0x%llX exact_beatmap=0x%llX exact_hitlist=0x%llX items=0x%llX count=%d first=0x%llX start_bindable=0x%llX start_value=%.3f position=%.3f,%.3f nested=0x%llX nested_count=%d",
+                stage ? stage : "unknown",
+                static_cast<unsigned long long>( game.player_screen ),
+                static_cast<unsigned long long>( drawable ),
+                static_cast<unsigned long long>( beatmap ),
+                static_cast<unsigned long long>( hit_list ),
+                static_cast<unsigned long long>( items ), count,
+                static_cast<unsigned long long>( first_object ),
+                static_cast<unsigned long long>( start_bindable ), start_value,
+                position_x, position_y,
+                static_cast<unsigned long long>( nested ), nested_count );
+        }
+
     public:
+        bool try_resolve_gameplay(
+            memory::c_process& process,
+            const osu::game_snapshot_t& game,
+            const offsets::lazer::table_t& off,
+            uint64_t& drawable,
+            const char*& failure_stage ) {
+
+            drawable = 0;
+            failure_stage = "offset table incomplete";
+
+            if ( !off.has_hitobject_offsets( ) )
+                return false;
+
+            if ( game.player_screen == 0 ) {
+                failure_stage = "player screen unavailable";
+                return false;
+            }
+
+            resolved_chain_t chain{};
+            int progress = 0;
+            if ( !resolve_chain( process, game, off, chain, &progress ) ) {
+                failure_stage = failure_stage_name( progress );
+                return false;
+            }
+
+            drawable = chain.drawable;
+            failure_stage = nullptr;
+            return true;
+        }
+
         bool try_load(
             memory::c_process& process,
             const osu::game_snapshot_t& game,
@@ -312,8 +449,11 @@ namespace beatmap {
                 return false;
 
             resolved_chain_t chain{};
-            if ( !resolve_chain( process, game, off, chain ) ) {
-                out.error = "lazer timing chain unresolved";
+            int progress = 0;
+            if ( !resolve_chain( process, game, off, chain, &progress ) ) {
+                const char* stage = failure_stage_name( progress );
+                out.error = std::string( "lazer timing chain unresolved: " ) + stage;
+                log_chain_failure_details( process, game, off, stage );
                 return false;
             }
 
@@ -389,6 +529,8 @@ namespace beatmap {
 
             if ( objects.empty( ) ) {
                 out.error = "lazer timing chain resolved but no hit object times decoded";
+                dbg::log( "lazer object decode failed: validated_count=%d decoded_count=0",
+                    chain.count );
                 return false;
             }
 
@@ -396,6 +538,12 @@ namespace beatmap {
                 []( const osu::hit_object_t& a, const osu::hit_object_t& b ) {
                     return a.start_time < b.start_time;
                 } );
+
+            const auto& first = objects.front( );
+            dbg::log(
+                "lazer objects decoded: validated_count=%d decoded_count=%zu first_time=%d first_position=%.2f,%.2f first_duration=%d first_type=%u",
+                chain.count, objects.size( ), first.start_time, first.x, first.y,
+                first.end_time - first.start_time, static_cast<unsigned>( first.type ) );
 
             for ( size_t i = 0; i < objects.size( ); ++i ) {
                 objects[ i ].stack_index = 0;

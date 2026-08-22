@@ -9,6 +9,7 @@
 #include <impl/memory/process.hxx>
 #include <impl/defs/offsets_lazer.hxx>
 #include <impl/util/playfield.hxx>
+#include <impl/util/debug_log.hxx>
 #include <impl/memory/input.hxx>
 #include <shared_mutex>
 #include <thread>
@@ -109,6 +110,9 @@ namespace threads {
         bool m_was_in_play = false;
         int32_t m_last_beatmap_game_time = -1;
         uint64_t m_leave_play_wall_ms = 0;
+        uint64_t m_last_lazer_diag_ms = 0;
+        std::string m_last_lazer_diag_stage;
+        std::atomic<bool> m_lazer_gameplay_ready{ false };
 
 
         module_tick_fn m_module_tick;
@@ -147,6 +151,8 @@ namespace threads {
                 }
             }
             else if ( m_client->kind( ) == osu::client_kind_t::lazer ) {
+                dbg::log( "lazer process attached: pid=%d layout_version=%s",
+                    pid, m_lazer_offsets.osu_version.c_str( ) );
                 const auto data_dir = beatmap::songs::resolve_lazer_data_dir( m_process );
                 m_lazer_memory.set_data_dir( data_dir );
                 m_last_map_sig.clear( );
@@ -181,6 +187,34 @@ namespace threads {
                 m_snapshot.beatmap = {};
             }
             m_last_map_sig.clear( );
+            m_lazer_gameplay_ready = false;
+        }
+
+        void log_lazer_resolution_failure(
+            const osu::game_snapshot_t& snap,
+            const char* stage ) {
+
+            const uint64_t now = GetTickCount64( );
+            const std::string current_stage = stage ? stage : "unknown";
+            if ( current_stage == m_last_lazer_diag_stage &&
+                 now - m_last_lazer_diag_ms < 5000 )
+                return;
+
+            m_last_lazer_diag_ms = now;
+            m_last_lazer_diag_stage = current_stage;
+            const bool has_map = snap.map_id > 0 || !snap.beatmap_hash.empty( ) ||
+                ( snap.set_id > 0 && !snap.beatmap_version.empty( ) );
+            dbg::log(
+                "lazer beatmap provider not attempted: stage=%s state=%d in_play=0 root=0x%llX player=0x%llX drawable=0x%llX api_match=%d offsets=1 hitobject_offsets=%d map_id=%d set_id=%d hash='%s' version='%s' has_map=%d time=%d",
+                current_stage.c_str( ),
+                static_cast<int>( snap.cur_state ),
+                static_cast<unsigned long long>( snap.game_base ),
+                static_cast<unsigned long long>( snap.player_screen ),
+                static_cast<unsigned long long>( snap.drawable_ruleset ),
+                snap.lazer_player_api_valid ? 1 : 0,
+                m_lazer_offsets.has_hitobject_offsets( ) ? 1 : 0,
+                snap.map_id, snap.set_id, snap.beatmap_hash.c_str( ),
+                snap.beatmap_version.c_str( ), has_map ? 1 : 0, snap.cur_time );
         }
 
         void process_loop( ) {
@@ -230,9 +264,51 @@ namespace threads {
                     snap.attached = true;
                     snap.pid = m_process.pid( );
                     m_client->update( m_process, snap );
+
+                    bool used_validated_fallback = false;
+                    if ( snap.client == osu::client_kind_t::lazer &&
+                         snap.cur_state != osu::game_state_t::play ) {
+                        const char* failure_stage = nullptr;
+
+                        if ( snap.game_base == 0 ) {
+                            failure_stage = "game root unavailable";
+                        }
+                        else if ( snap.player_screen == 0 ) {
+                            failure_stage = "screen stack/player unavailable";
+                        }
+                        else if ( !snap.lazer_player_api_valid ) {
+                            failure_stage = "Player API field/equality unresolved";
+                        }
+                        else {
+                            uint64_t resolved_drawable = 0;
+                            if ( m_lazer_memory.try_resolve_gameplay(
+                                    m_process, snap, resolved_drawable, failure_stage ) ) {
+                                snap.drawable_ruleset = resolved_drawable;
+                                snap.cur_state = osu::game_state_t::play;
+                                used_validated_fallback = true;
+                            }
+                        }
+
+                        if ( snap.cur_state != osu::game_state_t::play ) {
+                            m_lazer_gameplay_ready = false;
+                            log_lazer_resolution_failure( snap, failure_stage );
+                        }
+                    }
+
                     in_play = snap.cur_state == osu::game_state_t::play;
 
-
+                    if ( snap.client == osu::client_kind_t::lazer && in_play &&
+                         !m_lazer_gameplay_ready.exchange( true ) ) {
+                        dbg::log(
+                            "lazer gameplay resolved: source=%s root=0x%llX player=0x%llX drawable=0x%llX map_id=%d set_id=%d time=%d",
+                            used_validated_fallback ? "validated-nearby-field fallback" : "exact layout",
+                            static_cast<unsigned long long>( snap.game_base ),
+                            static_cast<unsigned long long>( snap.player_screen ),
+                            static_cast<unsigned long long>( snap.drawable_ruleset ),
+                            snap.map_id, snap.set_id, snap.cur_time );
+                        m_lazer_gameplay_ready = true;
+                        m_last_lazer_diag_stage.clear( );
+                    }
 
                     {
                         std::unique_lock lock( m_mutex );

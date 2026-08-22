@@ -102,6 +102,7 @@
   <ItemGroup>
     <ClInclude Include="core\aim_assist\aimbot.hxx" />
     <ClInclude Include="core\aim_assist\a_core.hxx" />
+    <ClInclude Include="core\aim_assist\slider_profile.hxx" />
     <ClInclude Include="core\autobot\autobot.hxx" />
     <ClInclude Include="core\autobot\motion_core.hxx" />
     <ClInclude Include="core\beatmap\i_beatmap_provider.hxx" />

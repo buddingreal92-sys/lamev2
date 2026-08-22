@@ -5,6 +5,7 @@
 #endif
 
 #include <core/aim_assist/a_core.hxx>
+#include <core/aim_assist/slider_profile.hxx>
 #include <impl/struct/game_snapshot.hxx>
 #include <impl/memory/input.hxx>
 #include <impl/util/playfield.hxx>
@@ -97,6 +98,21 @@ namespace aim_assist {
         uint64_t final_correction_miss_samples = 0;
         double first_rescue_miss_sum = 0.0;
         double final_correction_miss_sum = 0.0;
+        uint64_t slider_targets_evaluated = 0;
+        uint64_t slider_report_samples = 0;
+        uint64_t slider_assists_activated = 0;
+        uint64_t slider_safe_rejections = 0;
+        uint64_t slider_low_demand_rejections = 0;
+        uint64_t slider_compact_suppressions = 0;
+        uint64_t slider_requested_samples = 0;
+        double slider_demand_sum = 0.0;
+        double slider_geometry_demand_sum = 0.0;
+        double slider_entry_difficulty_sum = 0.0;
+        double slider_predicted_miss_sum = 0.0;
+        double slider_requested_correction_sum = 0.0;
+        float slider_peak_demand = 0.f;
+        float slider_peak_predicted_miss = 0.f;
+        float slider_peak_requested_correction = 0.f;
     };
 
     class c_aimbot {
@@ -191,6 +207,22 @@ namespace aim_assist {
             snap->cs = effective_cs;
             snap->targets.reserve( 16 );
 
+            const float osu_hit_radius = std::max(
+                4.f, 54.4f - 4.48f * effective_cs );
+            const int32_t first_time = map.objects.empty( ) ? 0 : map.objects.front( ).start_time;
+            const int32_t last_time = map.objects.empty( ) ? 0 : map.objects.back( ).start_time;
+            const std::string slider_cache_signature =
+                std::to_string( game.map_id ) + "|" + game.beatmap_hash + "|" +
+                std::to_string( map.objects.size( ) ) + "|" +
+                std::to_string( first_time ) + "|" + std::to_string( last_time ) + "|" +
+                std::to_string( static_cast<int>( std::lround( osu_hit_radius * 100.f ) ) ) + "|" +
+                std::to_string( static_cast<int>( std::lround( game.speed_mult * 1000.f ) ) );
+            if ( slider_cache_signature != m_slider_profile_signature ) {
+                m_slider_profile_signature = slider_cache_signature;
+                m_slider_profiles.clear( );
+                m_slider_profiles.resize( map.objects.size( ) );
+            }
+
             for ( size_t index = 0; index < map.objects.size( ); ++index ) {
                 const auto& obj = map.objects[ index ];
                 if ( obj.type & static_cast<uint8_t>( osu::hit_object_type_t::spinner ) )
@@ -212,10 +244,22 @@ namespace aim_assist {
                 t.hit_radius = hit_radius_screen( effective_cs, win_w, win_h );
                 t.alive = true;
                 t.is_slider = ( obj.type & static_cast<uint8_t>( osu::hit_object_type_t::slider ) ) != 0;
+                if ( t.is_slider && index < m_slider_profiles.size( ) ) {
+                    if ( !m_slider_profiles[ index ].has_value( ) ) {
+                        m_slider_profiles[ index ] = build_slider_profile(
+                            obj, hr_active && !map.hr, osu_hit_radius, game.speed_mult );
+                    }
+                    const auto& profile = *m_slider_profiles[ index ];
+                    t.slider_geometry_demand = profile.geometry_demand;
+                    t.slider_excursion_radii = profile.excursion_radii;
+                    t.slider_duration_ms = profile.duration_ms;
+                    t.slider_repeat = profile.repeat_count;
+                    t.slider_compact = profile.compact;
+                    t.slider_compact_repeat = profile.compact_repeat;
+                }
                 snap->targets.push_back( t );
             }
 
-            const float osu_hit_radius = std::max( 4.f, 54.4f - 4.48f * effective_cs );
             const local_difficulty_t local_difficulty = compute_local_difficulty(
                 snap->targets, osu_hit_radius, game.speed_mult );
             const adaptive_parameters_t adaptive = update_adaptive_parameters(
@@ -294,6 +338,8 @@ namespace aim_assist {
         float m_adaptive_large_jump_demand = 0.f;
         std::chrono::steady_clock::time_point m_adaptive_last_update{};
         bool m_adaptive_hard_active = false;
+        std::string m_slider_profile_signature;
+        std::vector<std::optional<slider_profile_t>> m_slider_profiles;
 
         struct adaptive_parameters_t {
             float difficulty = 0.f;
@@ -616,6 +662,9 @@ namespace aim_assist {
             case assist::gate_result::rejected_timing:
                 m_verification.rejected_timing++;
                 break;
+            case assist::gate_result::rejected_slider_low_demand:
+                // Counted in the dedicated slider selectivity telemetry below.
+                break;
             case assist::gate_result::corrected:
                 m_verification.corrected_reports++;
                 m_verification.corrected_predicted_miss_samples++;
@@ -637,6 +686,43 @@ namespace aim_assist {
             if ( m_state.safe_destination_multiplier > 0.f ) {
                 m_verification.safe_destination_multiplier =
                     m_state.safe_destination_multiplier;
+            }
+
+            if ( m_state.target_is_slider ) {
+                if ( m_state.slider_target_new )
+                    m_verification.slider_targets_evaluated++;
+                if ( m_state.slider_assist_activation )
+                    m_verification.slider_assists_activated++;
+                if ( m_state.slider_rejected_safe )
+                    m_verification.slider_safe_rejections++;
+                else if ( m_state.slider_rejected_low_demand )
+                    m_verification.slider_low_demand_rejections++;
+                if ( m_state.slider_compact_suppressed )
+                    m_verification.slider_compact_suppressions++;
+
+                m_verification.slider_report_samples++;
+                m_verification.slider_demand_sum += m_state.slider_assist_demand;
+                m_verification.slider_geometry_demand_sum +=
+                    m_state.slider_geometry_demand;
+                m_verification.slider_entry_difficulty_sum +=
+                    m_state.slider_entry_difficulty;
+                m_verification.slider_predicted_miss_sum +=
+                    m_state.closest_predicted_miss;
+                m_verification.slider_peak_demand = std::max(
+                    m_verification.slider_peak_demand,
+                    m_state.slider_assist_demand );
+                m_verification.slider_peak_predicted_miss = std::max(
+                    m_verification.slider_peak_predicted_miss,
+                    m_state.closest_predicted_miss );
+
+                if ( m_state.requested_correction ) {
+                    m_verification.slider_requested_samples++;
+                    m_verification.slider_requested_correction_sum +=
+                        m_state.requested_correction_magnitude;
+                    m_verification.slider_peak_requested_correction = std::max(
+                        m_verification.slider_peak_requested_correction,
+                        m_state.requested_correction_magnitude );
+                }
             }
 
             const float correction = assist::length( m_state.assist_offset );

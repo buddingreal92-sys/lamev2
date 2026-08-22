@@ -22,6 +22,7 @@ namespace osu {
         uint64_t game_base = 0;
         uint64_t player_screen = 0;
         uint64_t drawable_ruleset = 0;
+        bool lazer_player_api_valid = false;
         std::string client_version;
         std::string offset_version;
         bool offset_mismatch = false;

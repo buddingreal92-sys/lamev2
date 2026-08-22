@@ -1259,6 +1259,21 @@ namespace ui {
                 ? verify.first_rescue_miss_sum / static_cast<double>( verify.first_rescue_miss_samples ) : 0.0;
             const double average_final_correction_miss = verify.final_correction_miss_samples > 0
                 ? verify.final_correction_miss_sum / static_cast<double>( verify.final_correction_miss_samples ) : 0.0;
+            const double slider_reports = static_cast<double>( verify.slider_report_samples );
+            const double slider_activation_percent = verify.slider_targets_evaluated > 0
+                ? static_cast<double>( verify.slider_assists_activated ) * 100.0 /
+                    static_cast<double>( verify.slider_targets_evaluated ) : 0.0;
+            const double average_slider_demand = slider_reports > 0.0
+                ? verify.slider_demand_sum / slider_reports : 0.0;
+            const double average_slider_geometry = slider_reports > 0.0
+                ? verify.slider_geometry_demand_sum / slider_reports : 0.0;
+            const double average_slider_entry = slider_reports > 0.0
+                ? verify.slider_entry_difficulty_sum / slider_reports : 0.0;
+            const double average_slider_miss = slider_reports > 0.0
+                ? verify.slider_predicted_miss_sum / slider_reports : 0.0;
+            const double average_slider_requested = verify.slider_requested_samples > 0
+                ? verify.slider_requested_correction_sum /
+                    static_cast<double>( verify.slider_requested_samples ) : 0.0;
             const double adaptive_seconds = verify.adaptive_sample_seconds;
             const double average_adaptive_difficulty = adaptive_seconds > 0.0
                 ? verify.adaptive_difficulty_time_sum / adaptive_seconds : 0.0;
@@ -1351,6 +1366,33 @@ namespace ui {
                 kv( R_X + 14.f, ry, CW, "Avg corr L-M / H-X", vb );
                 sprintf_s( vb, "%.1f / %.1f px", average_first_rescue_miss, average_final_correction_miss );
                 kv( R_X + 14.f, ry, CW, "Miss rescue / final", vb );
+            }
+
+            if ( fold( R_X + 14.f, ry, CW, "SLIDER SELECTIVITY" ) ) {
+                sprintf_s( vb, "%llu / %llu  (%.1f%%)",
+                    static_cast<unsigned long long>( verify.slider_targets_evaluated ),
+                    static_cast<unsigned long long>( verify.slider_assists_activated ),
+                    slider_activation_percent );
+                kv( R_X + 14.f, ry, CW, "Targets / assisted", vb );
+                sprintf_s( vb, "%llu", static_cast<unsigned long long>( verify.slider_report_samples ) );
+                kv( R_X + 14.f, ry, CW, "Slider reports", vb );
+                sprintf_s( vb, "%llu / %llu",
+                    static_cast<unsigned long long>( verify.slider_safe_rejections ),
+                    static_cast<unsigned long long>( verify.slider_low_demand_rejections ) );
+                kv( R_X + 14.f, ry, CW, "Reject safe / easy", vb );
+                sprintf_s( vb, "%llu",
+                    static_cast<unsigned long long>( verify.slider_compact_suppressions ) );
+                kv( R_X + 14.f, ry, CW, "Compact suppressions", vb );
+                sprintf_s( vb, "%.2f / %.2f", average_slider_demand, verify.slider_peak_demand );
+                kv( R_X + 14.f, ry, CW, "Demand avg / peak", vb );
+                sprintf_s( vb, "%.2f / %.2f", average_slider_geometry, average_slider_entry );
+                kv( R_X + 14.f, ry, CW, "Geometry / entry avg", vb );
+                sprintf_s( vb, "%.1f / %.1f px", average_slider_miss,
+                    verify.slider_peak_predicted_miss );
+                kv( R_X + 14.f, ry, CW, "Pred. miss avg / peak", vb );
+                sprintf_s( vb, "%.2f / %.2f px", average_slider_requested,
+                    verify.slider_peak_requested_correction );
+                kv( R_X + 14.f, ry, CW, "Requested avg / peak", vb );
             }
 
             const float rbot = ry + 12.f;

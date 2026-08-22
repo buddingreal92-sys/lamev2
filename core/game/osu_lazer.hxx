@@ -321,8 +321,9 @@ namespace game {
                 screen_api = process.read<uint64_t>( current_screen + m_off.player_api );
 
             const auto drawable_ruleset = process.read<uint64_t>( current_screen + m_off.player_drawable_ruleset );
+            snap.lazer_player_api_valid = screen_api != 0 && screen_api == base_api;
 
-            if ( screen_api != 0 && screen_api == base_api && drawable_ruleset != 0 ) {
+            if ( snap.lazer_player_api_valid && drawable_ruleset != 0 ) {
                 snap.cur_state = osu::game_state_t::play;
                 snap.drawable_ruleset = drawable_ruleset;
             }
@@ -340,14 +341,30 @@ namespace game {
         uint64_t m_game_base = 0;
         resolved_mod_tokens_t m_tokens;
 
-        bool verify_game_base( memory::c_process& process, uint64_t addr ) {
-            if ( !addr || addr == 0xFFFFFFFFFFFFFFFF )
+        static bool plausible_managed_object( memory::c_process& process, uint64_t address ) {
+            if ( address < 0x10000 || address >= 0x0000800000000000ull || ( address & 0x7ull ) != 0 )
                 return false;
-            if ( addr < 0x10000 || addr > 0x7FFFFFFFFFFF )
+
+            MEMORY_BASIC_INFORMATION mbi{};
+            if ( !VirtualQueryEx( process.handle( ), reinterpret_cast<LPCVOID>( address ), &mbi, sizeof( mbi ) ) )
+                return false;
+            if ( mbi.State != MEM_COMMIT || mbi.Type != MEM_PRIVATE ||
+                 ( mbi.Protect & ( PAGE_NOACCESS | PAGE_GUARD ) ) != 0 )
+                return false;
+
+            const auto method_table = process.read<uint64_t>( address );
+            return method_table >= 0x10000 && method_table < 0x0000800000000000ull;
+        }
+
+        bool verify_game_base( memory::c_process& process, uint64_t addr ) {
+            // The game singleton is a mutable managed object. Requiring a committed
+            // private managed allocation rejects module-image/static-data lookalikes
+            // which can accidentally satisfy the old two-pointer back-reference test.
+            if ( !plausible_managed_object( process, addr ) )
                 return false;
 
             const auto api = process.read<uint64_t>( addr + m_off.game_base_api );
-            if ( !api || api == 0xFFFFFFFFFFFFFFFF || api < 0x10000 || api > 0x7FFFFFFFFFFF )
+            if ( !plausible_managed_object( process, api ) )
                 return false;
 
             const auto api_game = process.read<uint64_t>( api + m_off.api_access_game );
@@ -355,11 +372,27 @@ namespace game {
                 return false;
 
             const auto screen_stack = process.read<uint64_t>( addr + m_off.game_screen_stack );
-            if ( !screen_stack || screen_stack < 0x10000 || screen_stack > 0x7FFFFFFFFFFF )
+            if ( !plausible_managed_object( process, screen_stack ) )
+                return false;
+
+            const auto stack = process.read<uint64_t>( screen_stack + m_off.screen_stack_stack );
+            if ( !plausible_managed_object( process, stack ) )
+                return false;
+
+            const auto stack_count = process.read<int32_t>( stack + m_off.list_size );
+            const auto stack_items = process.read<uint64_t>( stack + m_off.list_items );
+            if ( stack_count <= 0 || stack_count > 128 ||
+                 !plausible_managed_object( process, stack_items ) )
+                return false;
+
+            const auto current_screen = process.read<uint64_t>(
+                stack_items + m_off.array_first_element +
+                static_cast<uint64_t>( stack_count - 1 ) * sizeof( uint64_t ) );
+            if ( !plausible_managed_object( process, current_screen ) )
                 return false;
 
             const auto beatmap_bindable = process.read<uint64_t>( addr + m_off.game_base_beatmap );
-            if ( !beatmap_bindable || beatmap_bindable < 0x10000 || beatmap_bindable > 0x7FFFFFFFFFFF )
+            if ( !plausible_managed_object( process, beatmap_bindable ) )
                 return false;
 
             return true;
